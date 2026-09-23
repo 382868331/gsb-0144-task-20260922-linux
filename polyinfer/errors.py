@@ -10,6 +10,11 @@
 调用方可以据此区分“输入太大没推”与“程序确实不可类型化”。
 本推断器是确定性的 Algorithm W，不存在搜索预算耗尽这一状态——
 每次统一失败都是该约束无解的构造性证据。
+
+v2 新增（记录/行、效应、模块）的错误同样是确定的构造性拒绝：
+:class:`DuplicateFieldError`（同名扩展）、
+:class:`SignatureError`（导出签名与实现不一致，含 skolem 逸出）、
+:class:`ModuleStructureError`（模块结构/依赖/导出缺失）。
 """
 
 from __future__ import annotations
@@ -43,7 +48,7 @@ class InvalidAstError(PolytypeError):
 
 
 class NodeLimitError(PolytypeError):
-    """节点数超过接口上限（默认 500）。这是资源拒绝，不是类型无解。"""
+    """节点数超过接口上限（v1 单表达式默认 500）。这是资源拒绝，不是类型无解。"""
 
     def __init__(self, count: int, limit: int) -> None:
         self.count = count
@@ -90,7 +95,7 @@ class TypeMismatchError(UnificationError):
 
 
 class InfiniteTypeError(UnificationError):
-    """occurs 检查失败：类型变量出现在自身展开式中，会构成无限类型（已证明无解）。"""
+    """occurs 检查失败：类型/行变量出现在自身展开式中，构成无限类型（已证明无解）。"""
 
     def __init__(
         self,
@@ -107,4 +112,69 @@ class InfiniteTypeError(UnificationError):
             variable,
             expanded,
             f"无限类型：{variable} 出现在 {expanded} 中",
+        )
+
+
+class EffectMismatchError(UnificationError):
+    """效应冲突：把实际带效应的函数当作纯函数使用等（已证明无解）。
+
+    效应统一本身是并集（只会累积，不冲突）；本错误用于函数类型逐点
+    比较中效应集合不相容的定位场景（如签名检查里声明纯、实现有写效应）。
+    """
+
+    def __init__(self, left_path: Path, right_path: Path, left_eff: Any, right_eff: Any) -> None:
+        super().__init__(
+            left_path,
+            right_path,
+            left_eff,
+            right_eff,
+            "效应集合不相容",
+        )
+
+
+class DuplicateFieldError(PolytypeError):
+    """记录扩展时同名字段已存在（含开放行经替换暴露出的同名冲突）。"""
+
+    def __init__(self, path: Path, field: str) -> None:
+        self.path = path
+        self.field = field
+        super().__init__(
+            f"记录字段 {field!r} 重复（位置 {format_path(path)}）："
+            "扩展不允许覆盖已有字段，原记录不变"
+        )
+
+
+class MissingFieldError(UnificationError):
+    """字段访问时闭行确定缺少该字段（已证明无解）。"""
+
+    def __init__(self, left_path: Path, right_path: Path, left_type: Any, right_type: Any) -> None:
+        super().__init__(
+            left_path, right_path, left_type, right_type, "记录缺少被访问字段"
+        )
+
+
+# ---------------------------------------------------------------- 模块层
+
+class ModuleError(PolytypeError):
+    """模块结构/依赖类错误的公共基类。"""
+
+
+class ModuleStructureError(ModuleError):
+    """模块包结构非法：模块缺失、import 未知、导出无绑定/无签名、字段非法等。"""
+
+    def __init__(self, message: str, module: str | None = None) -> None:
+        self.module = module
+        where = f"（模块 {module!r}）" if module is not None else ""
+        super().__init__(f"模块结构非法{where}：{message}")
+
+
+class SignatureError(ModuleError):
+    """实现与其导出签名不一致（含被引用写入污染的变量越界泛化、skolem 逸出）。"""
+
+    def __init__(self, module: str, export: str, detail: str) -> None:
+        self.module = module
+        self.export = export
+        self.detail = detail
+        super().__init__(
+            f"模块 {module!r} 的导出 {export!r} 未通过签名检查：{detail}"
         )
