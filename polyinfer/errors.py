@@ -108,3 +108,62 @@ class InfiniteTypeError(UnificationError):
             expanded,
             f"无限类型：{variable} 出现在 {expanded} 中",
         )
+
+
+class RecordFieldError(PolytypeError):
+    """记录字段相关的不可满足：缺字段、同名扩展、开放行展开后字段重复。
+
+    与 :class:`TypeMismatchError` 分开，便于调用方区分“行/字段契约”冲突
+    与普通构造子冲突；它同样是构造性无解，不是资源拒绝。
+    """
+
+    def __init__(self, left_path: Path, right_path: Path, field: Any, message: str) -> None:
+        self.left_path = left_path
+        self.right_path = right_path
+        self.field = field
+        super().__init__(
+            f"记录字段冲突（字段 {field!r}）：{message}；"
+            f"左端 {format_path(left_path)}，右端 {format_path(right_path)}"
+        )
+
+
+class EffectMismatchError(PolytypeError):
+    """函数潜在效应集合无法与签名/目标一致（具体效应标签冲突）。"""
+
+    def __init__(
+        self,
+        left_path: Path,
+        right_path: Path,
+        left_eff: frozenset,
+        right_eff: frozenset,
+        note: str,
+    ) -> None:
+        self.left_path = left_path
+        self.right_path = right_path
+        self.left_eff = left_eff
+        self.right_eff = right_eff
+
+        def fmt(e):
+            return "{" + ",".join(sorted(e)) + "}" if e else "{}"
+
+        super().__init__(
+            f"效应不一致（{note}）：{fmt(left_eff)} ≠ {fmt(right_eff)}；"
+            f"左端 {format_path(left_path)}，右端 {format_path(right_path)}"
+        )
+
+
+class SkolemEscapeError(PolytypeError):
+    """模块边界泛化逃逸：0 层可变引用单元中的类型变量被绑定到刚性签名变量。
+
+    这正是“携带可变引用的类型变量不能被模块边界偷偷泛化”的构造性拒绝。
+    """
+
+    def __init__(self, cell_var: Any, target: Any, skolems: list) -> None:
+        self.cell_var = cell_var
+        self.target = target
+        self.skolems = skolems
+        super().__init__(
+            f"模块边界逃逸：顶层可变引用单元变量 {cell_var} 被要求为 "
+            f"{target}（含刚性签名变量 {', '.join(str(s) for s in skolems)}）；"
+            f"携带可变引用的类型变量不得经导出签名泛化"
+        )
