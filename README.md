@@ -13,12 +13,13 @@
 # 必要测试（在仓库根目录执行）
 python -m unittest discover -s tests -v
 
-# 固定输入演示：真实计算并打印 1 个主类型 + 1 个实际触发的拒绝
+# 固定输入演示：真实计算并打印主类型、实际触发的拒绝，以及诊断模式的
+# 包含极小冲突集、occurs/构造子不合区分与来源轨迹
 python demo.py
 ```
 
-demo 不含 `sleep`、不读预录结果、不做压力测试，实测耗时约 0.05 秒
-（上限 8 秒内）。
+demo 不含 `sleep`、不读预录结果、不做压力测试，实测耗时约 0.07 秒
+（上限 90 秒内）。
 
 ## 公开接口
 
@@ -39,10 +40,15 @@ result.principal_type   # "a -> a"：按首次出现规范命名的主类型字�
 result.type             # 结构化类型对象（TVar/TCon/TFun/TRef）
 result.names            # {TVar: "a"|"b"|...}
 result.subst            # 最终幂等替换（{TVar: Type}）
-result.constraints      # 全部统一等式留痕（含两端 AST 路径）
+result.constraints      # 全部统一等式留痕（含两端 AST 路径与义务来源）
 result.generalizations  # 全部 let 泛化事件留痕
+result.events           # 多态实例化来源事件（使用点 -> 方案引入位置）
 result.node_count       # AST 节点数
 result.verify()         # 独立替换器逐约束核验（不经过统一核心）
+
+# 诊断入口（与 infer 并列）：失败时给出按编号确定的包含极小冲突集。
+from polyinfer import diagnose
+report = diagnose(ast, max_nodes=500, budget=4096)
 ```
 
 ### AST 数据结构（普通 dict，可 JSON 化）
@@ -84,7 +90,10 @@ Ref(a) -> Unit                 λr. r := !r
 - **可定位**：结构错误带 `path`；统一失败带失败约束**两端**各自的
   AST 路径 `left_path` / `right_path`，并随函数参数/返回值、引用单元
   下钻（`[arg]` / `[ret]` / `[inner]`）到真正冲突的叶子，同时给出
-  叶子两端类型（内部变量名 `?n`；规范名只用于最终主类型）。
+  叶子两端类型（内部变量名 `?n`；规范名只用于最终主类型）。异常还带
+  `obligation`（诱发该等式的输入义务身份 `(kind, path)`）与
+  `kind`（`"mismatch"` 普通构造子不合 / `"occurs"` 无限类型），
+  供诊断模式编号与分类。
 - **不静默纠正**：`int` 节点只接受真正的 `int`（`bool` 虽是 `int`
   子类但显式拒绝）；`float` 不隐式截断；若以 float 提供，NaN 与
   ±Infinity 作为非有限值明确拒绝，其他 float 同样拒绝。
@@ -114,6 +123,64 @@ Ref(a) -> Unit                 λr. r := !r
 6. **非递归 let**：绑定表达式作用域不含被绑定名字；递归定义不在本
    契约内，绑定树中引用同名变量报 `UnboundVariableError`。
 
+## 诊断模式（`polyinfer.diagnose`）
+
+普通入口 `infer` 在第一处统一失败即停止，只能给出"两个位置不合"。
+并列的诊断入口 `diagnose(ast, max_nodes=500, budget=4096)` 则回答
+"**哪几条输入约束合起来才有问题**"：
+
+```python
+from polyinfer import A, diagnose
+
+report = diagnose(program)
+report.ok                  # 可类型化时为 True，主类型与 infer 逐字一致
+report.cores               # 一个或多个互不相交的包含极小冲突核
+report.conflict_numbers    # 首个核的编号，例如 (1, 2)
+report.minimal             # 是否已完成逆序缩减 + 逐条必要性核验
+report.budget_exhausted    # 独立重放预算是否耗尽（耗尽不假称极小）
+report.describe()          # 给编辑器/人看的多行说明
+for info in report.obligations:   # 全部带稳定编号的输入约束
+    info.number, info.kind, info.path, info.note
+core = report.cores[0]
+core.numbers                      # 核内编号（升序）
+core.conflicts                    # 每条义务的叶子两端类型/路径
+core.provenance.witness_kind      # "mismatch"（构造子不合）| "occurs"
+core.provenance.binds             # 每次替换绑定来自哪条编号义务
+core.provenance.instantiations    # 多态实例化 使用点 -> let/lambda 来源
+```
+
+**输入约束的稳定编号**。一条"输入约束"是一个语言构造诱发的顶层统一
+义务：`apply`（被应用值必须是函数）、`if` 条件（必须为 Bool）、`if`
+两分支（类型一致）、`read`（被解引用值必须是引用）、`write`
+（单元类型等于写入值类型）。函数箭头/引用的结构下钻属于同一条义务，
+不另编号。编号由一次**纯 AST 结构遍历**在任何推断之前按确定的先序
+顺序给出（同一 `if` 节点先条件后分支），只取决于 AST，与推断状态、
+替换、重放次数无关，因此同一棵树多次诊断结果逐字一致。
+
+**包含极小冲突集的求法（按编号确定）**。Algorithm W 遇首个失败即停，
+诊断用重放补齐证据：先完整重放（证明全部约束不可满足），然后从全部
+义务出发按编号**逆序**逐条尝试删除——删除后用**冻结的原始约束**重放，
+仍冲突就保留这次删除，可满足则该约束必要、恢复，一整轮结束；最后再
+逐条重放核验"最终集合中删去任意一条都可满足"。结果是包含极小
+（inclusion-minimal）冲突集，**不追求最小基数**：当多个约束彼此冗余
+时，按编号顺序确定地保留小编号约束。程序里存在多处**相互独立**的
+错误时，报告含多个互不相交的核（修好第一组后，第二组仍在）。
+
+**重放纪律**。每一轮重放都新建推断器、新建类型变量计数器、从空替换
+开始，使用同一棵冻结 AST，绝不携带上一轮失败的并查集或替换。跳过一条
+义务等价于不施加那条等式（少做若干变量绑定），值限制、作用域、
+occurs 检查、字面量契约在跳过路径上**一字未松**；成功的跳过重放结果
+同样通过独立参考检查器核验。诊断不引入任何新语法或新类型系统成分。
+
+**两类失败可区分**。`witness_kind == "mismatch"` 是普通构造子不合
+（如 Int 对 Bool），`"occurs"` 是 occurs 检查失败（无限类型，如
+λx. x x）；编辑器可据此分别措辞。
+
+**独立预算**。诊断的重放轮数预算（`budget`，默认 4096，含首轮）独立于
+500 节点上限。预算耗尽时 `minimal=False`、`budget_exhausted=True`，
+只返回尚未缩减完的冲突证据并在 `describe()` 中明确声明，绝不假称极小。
+非法 AST、未绑定变量、超节点上限不是约束冲突，照常抛原有异常。
+
 ## 独立参考检查器（`polyinfer.reference`）
 
 - 自带替换应用（带循环检测）、自由变量收集、结构同构判定，
@@ -131,6 +198,11 @@ Ref(a) -> Unit                 λr. r := !r
 - AST 节点数默认上限 **500**（`infer(ast, max_nodes=...)` 可调，
   属接口边界）；超限抛 `NodeLimitError`。短演示不穷举上限规模；
   测试覆盖 499/500/501 边界语义。
+- 诊断模式另有**独立**的重放预算 `budget`（`diagnose(..., budget=...)`，
+  默认 4096 轮，含首轮），与节点上限互不影响。逆序贪心 + 逐条核验的
+  重放次数最坏为义务数的线性倍数（每核约 ``2×核缩减涉及的义务数``），
+  单轮重放是普通推断；默认 500 节点的病态程序实测在数秒内完成，
+  demo 总耗时约 0.07 秒（90 秒限制内）。预算耗尽只给未缩减完的证据。
 - 整数支持 Python 任意精度大整数；本语言没有浮点类型与浮点运算，
   因此 README 无需浮点误差口径——不存在浮点结果，float 输入被拒绝。
 
@@ -139,14 +211,18 @@ Ref(a) -> Unit                 λr. r := !r
 ```text
 polyinfer/
   __init__.py    公开接口
-  ast.py         AST 构造器与结构/作用域/上限校验
+  ast.py         AST 构造器与结构/作用域/上限校验、义务身份定义
   types.py       类型结构、occurs、apply、bind 替换组合、渲染、规范命名
-  inference.py   Algorithm W 核心、值限制、约束/泛化留痕、infer() 入口
+  inference.py   Algorithm W 核心、值限制、约束/泛化/实例化/绑定留痕、
+                 infer() 入口与诊断重放原语（全新推断器/空替换）
+  diagnosis.py   诊断模式：稳定编号、逆序贪心包含极小化、独立预算、
+                 多核报告与来源轨迹
   reference.py   独立参考检查器（不经过统一核心）
-  errors.py      错误类型体系与路径渲染
+  errors.py      错误类型体系与路径渲染（mismatch/occurs 可区分）
 tests/           unittest 测试（替换原语、推断、四个验收场景、
-                 输入契约、独立检查器与篡改检测、确定性生成测试）
-demo.py          固定输入演示
+                 输入契约、独立检查器与篡改检测、确定性生成测试、
+                 诊断模式的编号/极小核/多核/遮蔽/预算/来源轨迹）
+demo.py          固定输入演示（普通推断 + 诊断模式）
 ```
 
 四个验收场景均有对应测试（`tests/test_inference.py`）：

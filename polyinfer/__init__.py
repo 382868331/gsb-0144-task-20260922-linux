@@ -3,6 +3,7 @@
 公开接口::
 
     from polyinfer import infer, A
+    from polyinfer.diagnosis import diagnose, DiagnosisReport
     from polyinfer.errors import (
         PolytypeError, InvalidAstError, NodeLimitError,
         UnboundVariableError, TypeMismatchError, InfiniteTypeError,
@@ -13,11 +14,22 @@
     result.principal_type        # "a -> a"
     result.verify()             # 独立替换器核验（不经过统一核心）
 
+    report = diagnose(program)  # 诊断模式：包含极小冲突集与来源轨迹
+
 节点用 :mod:`polyinfer.ast` 里的构造器（``A`` 是该模块的别名）或同构 dict
 构造；详见 README。
 """
 
 from . import ast as A
+from .diagnosis import (
+    BindInfo,
+    ConflictEvidence,
+    CoreReport,
+    DiagnosisReport,
+    ObligationInfo,
+    Provenance,
+    diagnose,
+)
 from .errors import (
     InfiniteTypeError,
     InvalidAstError,
@@ -51,6 +63,13 @@ from .types import (
 __all__ = [
     "A",
     "infer",
+    "diagnose",
+    "DiagnosisReport",
+    "CoreReport",
+    "ObligationInfo",
+    "ConflictEvidence",
+    "Provenance",
+    "BindInfo",
     "InferenceResult",
     "Constraint",
     "Generalization",

@@ -61,7 +61,16 @@ class UnboundVariableError(PolytypeError):
 
 
 class UnificationError(PolytypeError):
-    """统一失败的公共基类，携带失败约束两端的 AST 路径与类型。"""
+    """统一失败的公共基类，携带失败约束两端的 AST 路径与类型。
+
+    ``obligation`` 是失败等式所属的顶层输入义务身份
+    ``(kind, path)``；无输入义务（不应被诊断跳过的内部等式）时为 ``()``。
+    子类 :class:`TypeMismatchError`（普通构造子不合）与
+    :class:`InfiniteTypeError`（occurs 检查失败）始终可凭 ``kind``
+    或异常类型区分。
+    """
+
+    kind = "unification"
 
     def __init__(
         self,
@@ -70,12 +79,17 @@ class UnificationError(PolytypeError):
         left_type: Any,
         right_type: Any,
         message: str,
+        obligation: Tuple[Any, ...] = (),
+        note: str = "",
     ) -> None:
         self.left_path = left_path
         self.right_path = right_path
         # 叶子冲突位置上的两个类型（函数与函数统一时，深入到真正冲突的那对）。
         self.left_type = left_type
         self.right_type = right_type
+        self.obligation = obligation
+        # 诱发该等式的输入义务说明（随结构下钻追加"：参数/返回值/引用单元"）。
+        self.note = note
         super().__init__(
             f"{message}：左端 {left_type} @ {format_path(left_path)}；"
             f"右端 {right_type} @ {format_path(right_path)}"
@@ -85,12 +99,18 @@ class UnificationError(PolytypeError):
 class TypeMismatchError(UnificationError):
     """两个不同外构造子的类型无法统一（已证明无解）。"""
 
-    def __init__(self, left_path: Path, right_path: Path, left_type: Any, right_type: Any) -> None:
-        super().__init__(left_path, right_path, left_type, right_type, "类型不一致")
+    kind = "mismatch"
+
+    def __init__(self, left_path: Path, right_path: Path, left_type: Any, right_type: Any,
+                 obligation: Tuple[Any, ...] = (), note: str = "") -> None:
+        super().__init__(left_path, right_path, left_type, right_type, "类型不一致",
+                         obligation, note)
 
 
 class InfiniteTypeError(UnificationError):
     """occurs 检查失败：类型变量出现在自身展开式中，会构成无限类型（已证明无解）。"""
+
+    kind = "occurs"
 
     def __init__(
         self,
@@ -98,6 +118,8 @@ class InfiniteTypeError(UnificationError):
         right_path: Path,
         variable: Any,
         expanded: Any,
+        obligation: Tuple[Any, ...] = (),
+        note: str = "",
     ) -> None:
         self.variable = variable
         self.expanded = expanded
@@ -107,4 +129,6 @@ class InfiniteTypeError(UnificationError):
             variable,
             expanded,
             f"无限类型：{variable} 出现在 {expanded} 中",
+            obligation,
+            note,
         )

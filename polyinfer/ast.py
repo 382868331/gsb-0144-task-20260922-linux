@@ -45,6 +45,21 @@ NODE_FIELDS: Dict[str, Tuple[str, ...]] = {
 Node = Dict[str, Any]
 Path = Tuple[str, ...]
 
+Node = Dict[str, Any]
+Path = Tuple[str, ...]
+ObligationId = Tuple[str, Path]
+
+# 顶层统一等式（"义务"）的种类与"挂点"路径（挂点就是该义务由哪个 AST
+# 节点诱发）。结构下钻（[arg]/[ret]/[inner]）不产生新义务。
+# 诊断模式据此给输入约束稳定编号；顺序与种类表只取决于 AST 本身，
+# 不取决于推断状态。
+OBLIGATION_KINDS = ("apply", "if_cond", "if_branches", "read", "write")
+
+
+def obligation_id(kind: str, path: Path) -> ObligationId:
+    """一条顶层统一义务的稳定身份：(种类, 诱发节点的 AST 路径)。"""
+    return (kind, path)
+
 
 # ---------------------------------------------------------------- 构造器
 
