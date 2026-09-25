@@ -23,10 +23,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import count
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, FrozenSet, List, Tuple
 
 from . import ast as ast_mod
 from .errors import (
@@ -60,11 +61,29 @@ _VALUE_TAGS = frozenset({"int", "bool", "lambda", "var"})
 
 
 @dataclass(frozen=True)
+class SchemeOrigin:
+    """类型方案的来源描述（实例化追踪用）。
+
+    * ``kind``：``"let"``（let 绑定，可能多态）或
+      ``"lambda-param"``（lambda 形参，单态）；
+    * ``path``：引入该方案的 AST 节点路径（let 节点 / lambda 节点）；
+    * ``bound_tag``：let 绑定表达式的 tag（lambda 形参为 ``"lambda"``）；
+    * ``polymorphic``：方案是否带被限定变量（值限制下扩展式为 False）。
+    """
+
+    kind: str
+    path: Path
+    bound_tag: str
+    polymorphic: bool
+
+
+@dataclass(frozen=True)
 class TypeScheme:
     """类型方案 ``forall quantified . t``。"""
 
     quantified: frozenset
     t: Type
+    origin: "SchemeOrigin | None" = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +95,38 @@ class Constraint:
     left_path: Path
     right_path: Path
     note: str
+
+
+@dataclass(frozen=True)
+class BindTrace:
+    """一次成功绑定（替换的一步）的来源留痕。
+
+    诊断模式据此回答“变量 ?n 是被哪条编号约束、统一成什么的”。
+    ``key`` 是该次绑定所属顶层统一的稳定键（两端 AST 路径对）。
+    """
+
+    var_ident: int
+    rhs: Type
+    key: "Tuple[Path, Path]"
+    note: str
+
+
+@dataclass(frozen=True)
+class InstantiationTrace:
+    """一次类型方案实例化的来源留痕（变量使用点）。
+
+    * ``use_path``/``name``：使用点的 AST 路径与变量名；
+    * ``source``：被实例化方案的来源（哪个 let / 哪个 lambda 形参）；
+    * ``polymorphic``：该使用是否真的取到了新副本（非平凡重命名）；
+    * ``renaming``：被限定变量 -> 新变量的 ident 映射，证明多态实例
+      每次都拿到互不相同的全新变量。
+    """
+
+    use_path: Path
+    name: str
+    source: "SchemeOrigin"
+    polymorphic: bool
+    renaming: "Tuple[Tuple[int, int], ...]"
 
 
 @dataclass(frozen=True)
@@ -128,21 +179,79 @@ class InferenceResult:
 
 
 class Inferencer:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        tolerant: bool = False,
+        skip_keys: "FrozenSet[Tuple[Path, Path]] | None" = None,
+        trace: bool = False,
+    ) -> None:
+        """普通模式：``tolerant=False``，统一失败即抛。
+
+        诊断模式（``tolerant=True``）：
+
+        * 统一失败不抛出，而是把错误记入 ``failures`` 并返回**未扩展**
+          的替换继续遍历，使整棵 AST 的约束都能被枚举出来；
+        * ``skip_keys`` 中的顶层统一等式（以两端 AST 路径为稳定键）
+          被整体跳过——不记录约束、不绑定、不下钻；
+        * ``trace=True`` 时额外记录绑定来源 (:attr:`bind_trace`) 与
+          实例化来源 (:attr:`instantiation_trace`)。
+
+        诊断模式只服务于 :mod:`polyinfer.diagnose`：它产出的替换可能
+        不完整，绝不作为成功结果返回；值限制、occurs 等限制一条不放宽。
+        """
         self._counter = count()
         self.constraints: List[Constraint] = []
         self.generalizations: List[Generalization] = []
+        self.tolerant = tolerant
+        self.skip_keys = skip_keys or frozenset()
+        self.trace = trace
+        self.bind_trace: List[BindTrace] = []
+        self.instantiation_trace: List[InstantiationTrace] = []
+        # (统一异常, 顶层约束键)：容错遍历时失败不抛出，登记在此。
+        self.failures: List[Tuple[Exception, Tuple[Path, Path]]] = []
 
     # ------------------------------------------------------------ 工具
 
     def fresh(self) -> TVar:
         return TVar(next(self._counter))
 
-    def instantiate(self, scheme: TypeScheme) -> Type:
-        """实例化类型方案：每个被限定变量换一个全新类型变量。"""
+    def instantiate(
+        self,
+        scheme: TypeScheme,
+        use_path: "Path | None" = None,
+        name: "str | None" = None,
+    ) -> Type:
+        """实例化类型方案：每个被限定变量换一个全新类型变量。
+
+        诊断追踪开启时，用 ``use_path``/``name`` 记录使用点与方案来源；
+        普通推断调用（无使用点）行为与原来完全一致。
+        """
         if not scheme.quantified:
+            if self.trace and use_path is not None and scheme.origin is not None:
+                self.instantiation_trace.append(
+                    InstantiationTrace(
+                        use_path=use_path,
+                        name=name or "",
+                        source=scheme.origin,
+                        polymorphic=False,
+                        renaming=(),
+                    )
+                )
             return scheme.t
         mapping = {v: self.fresh() for v in scheme.quantified}
+        if self.trace and use_path is not None and scheme.origin is not None:
+            self.instantiation_trace.append(
+                InstantiationTrace(
+                    use_path=use_path,
+                    name=name or "",
+                    source=scheme.origin,
+                    polymorphic=True,
+                    renaming=tuple(
+                        sorted((v.ident, nv.ident) for v, nv in mapping.items())
+                    ),
+                )
+            )
         return _rename(scheme.t, mapping)
 
     def unify(
@@ -159,58 +268,102 @@ class Inferencer:
         失败时抛出 :class:`TypeMismatchError` 或 :class:`InfiniteTypeError`，
         路径随类型结构下钻而追加 ``[arg]``/``[ret]``/``[inner]``，
         定位到真正冲突的叶子。
+
+        诊断模式下，由 AST 节点直接诱导的顶层等式若在 ``skip_keys`` 中
+        （以两端 AST 路径为稳定键）则整体跳过——不下钻、不绑定；
+        统一失败不抛出，记录后返回当前替换。任何模式都不放宽 occurs
+        与构造子检查。
         """
+        key = (left_path, right_path)
+        if key in self.skip_keys:
+            return s
+        return self._unify_frame(s, left, right, left_path, right_path, note, key)
+
+    def _unify_frame(
+        self,
+        s: Subst,
+        left: Type,
+        right: Type,
+        left_path: Path,
+        right_path: Path,
+        note: str,
+        key: "Tuple[Path, Path]",
+    ) -> Subst:
         l = apply(s, left)
         r = apply(s, right)
         self.constraints.append(Constraint(l, r, left_path, right_path, note))
+
+        def fail(exc: "UnificationError") -> Subst:
+            self.failures.append((exc, key))
+            return s
 
         if isinstance(l, TVar):
             if isinstance(r, TVar) and l == r:
                 return s
             # 检查 l 是否出现在 r 中（occurs 检查，防止无限类型）。
             if occurs(l, r):
-                raise InfiniteTypeError(left_path, right_path, l, r)
+                exc = InfiniteTypeError(left_path, right_path, l, r)
+                if self.tolerant:
+                    return fail(exc)
+                raise exc
+            if self.trace:
+                self.bind_trace.append(BindTrace(l.ident, r, key, note))
             return bind(s, l, r)
         if isinstance(r, TVar):
             if occurs(r, l):
-                raise InfiniteTypeError(right_path, left_path, r, l)
+                exc = InfiniteTypeError(right_path, left_path, r, l)
+                if self.tolerant:
+                    return fail(exc)
+                raise exc
+            if self.trace:
+                self.bind_trace.append(BindTrace(r.ident, l, key, note))
             return bind(s, r, l)
 
         if isinstance(l, TCon) and isinstance(r, TCon):
             if l.name == r.name:
                 return s
-            raise TypeMismatchError(left_path, right_path, l, r)
+            exc = TypeMismatchError(left_path, right_path, l, r)
+            if self.tolerant:
+                return fail(exc)
+            raise exc
 
         if isinstance(l, TFun) and isinstance(r, TFun):
-            s1 = self.unify(
+            # 下钻出的子等式沿用同一个顶层约束键（skip 只针对整等式）。
+            s1 = self._unify_frame(
                 s,
                 l.arg,
                 r.arg,
                 left_path + ("[arg]",),
                 right_path + ("[arg]",),
                 f"{note}：参数",
+                key,
             )
-            s2 = self.unify(
+            s2 = self._unify_frame(
                 s1,
                 apply(s1, l.ret),
                 apply(s1, r.ret),
                 left_path + ("[ret]",),
                 right_path + ("[ret]",),
                 f"{note}：返回值",
+                key,
             )
             return s2
 
         if isinstance(l, TRef) and isinstance(r, TRef):
-            return self.unify(
+            return self._unify_frame(
                 s,
                 l.inner,
                 r.inner,
                 left_path + ("[inner]",),
                 right_path + ("[inner]",),
                 f"{note}：引用单元",
+                key,
             )
 
-        raise TypeMismatchError(left_path, right_path, l, r)
+        exc = TypeMismatchError(left_path, right_path, l, r)
+        if self.tolerant:
+            return fail(exc)
+        raise exc
 
     # ------------------------------------------------------------ 规则
 
@@ -226,7 +379,7 @@ class Inferencer:
         scheme = env.get(name)
         if scheme is None:
             raise UnboundVariableError(path, name)
-        return s, self.instantiate(scheme)
+        return s, self.instantiate(scheme, use_path=path, name=name)
 
     def _ti_int(self, node, env, s, path):
         return s, INT
@@ -238,7 +391,16 @@ class Inferencer:
         param_var = self.fresh()
         body_env = dict(env)
         # lambda 参数是单态绑定：空限定集的平凡方案，函数体内共享同一个变量。
-        body_env[node["param"]] = TypeScheme(frozenset(), param_var)
+        body_env[node["param"]] = TypeScheme(
+            frozenset(),
+            param_var,
+            SchemeOrigin(
+                kind="lambda-param",
+                path=path,
+                bound_tag="lambda",
+                polymorphic=False,
+            ),
+        )
         s1, body_t = self.ti(node["body"], body_env, s, path + ("body",))
         return s1, TFun(apply(s1, param_var), body_t)
 
@@ -266,11 +428,29 @@ class Inferencer:
         if bound_tag in _VALUE_TAGS:
             env_free = _env_free_vars(env, s1)
             quantified = tuple(v for v in free_tvars(bound_t) if v not in env_free)
-            scheme = TypeScheme(frozenset(quantified), bound_t)
+            scheme = TypeScheme(
+                frozenset(quantified),
+                bound_t,
+                SchemeOrigin(
+                    kind="let",
+                    path=path,
+                    bound_tag=bound_tag,
+                    polymorphic=bool(quantified),
+                ),
+            )
         else:
             # 值限制：扩展式（ref、apply、read、write、if ...）不泛化。
             quantified = ()
-            scheme = TypeScheme(frozenset(), bound_t)
+            scheme = TypeScheme(
+                frozenset(),
+                bound_t,
+                SchemeOrigin(
+                    kind="let",
+                    path=path,
+                    bound_tag=bound_tag,
+                    polymorphic=False,
+                ),
+            )
 
         self.generalizations.append(
             Generalization(
@@ -384,6 +564,30 @@ def _env_free_vars(env: Dict[str, TypeScheme], s: Subst):
 
 # ---------------------------------------------------------------- 入口
 
+def _validate_max_nodes(max_nodes: int) -> None:
+    # 接口参数自身的合法性（不静默纠正：bool 不算 int）。
+    if isinstance(max_nodes, bool) or not isinstance(max_nodes, int):
+        raise TypeError(f"max_nodes 必须是 int，实际为 {type(max_nodes).__name__}")
+    if max_nodes < 1:
+        raise ValueError(f"max_nodes 必须为正整数，实际为 {max_nodes}")
+
+
+@contextmanager
+def _recursion_room(max_nodes: int):
+    """临时为深 AST 的校验/ti/替换应用/渲染腾出 Python 递归帧。
+
+    无论成功失败都恢复调用前的值，不给解释器进程留下未说明的全局变更。
+    """
+    old_limit = sys.getrecursionlimit()
+    needed = 200 * max_nodes + 1000
+    if needed > old_limit:
+        sys.setrecursionlimit(needed)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(old_limit)
+
+
 def infer(ast: ast_mod.Node, max_nodes: int = 500) -> InferenceResult:
     """推断整棵 AST 的主类型。
 
@@ -395,30 +599,17 @@ def infer(ast: ast_mod.Node, max_nodes: int = 500) -> InferenceResult:
     :raises TypeMismatchError / InfiniteTypeError: 已证明不可类型化，
         携带失败约束两端的 AST 路径与叶子类型。
     """
-    # 接口参数自身的合法性（不静默纠正：bool 不算 int）。
-    if isinstance(max_nodes, bool) or not isinstance(max_nodes, int):
-        raise TypeError(f"max_nodes 必须是 int，实际为 {type(max_nodes).__name__}")
-    if max_nodes < 1:
-        raise ValueError(f"max_nodes 必须为正整数，实际为 {max_nodes}")
-
-    # AST 最深可达 max_nodes（500）层，每层校验/ti/替换应用会产生多个
-    # Python 帧，临时提高递归上限；无论成功失败都恢复调用前的值，
-    # 不给解释器进程留下未说明的全局变更。
-    old_limit = sys.getrecursionlimit()
-    needed = 200 * max_nodes + 1000
-    if needed > old_limit:
-        sys.setrecursionlimit(needed)
-    try:
-        validator = ast_mod.AstValidator(max_nodes)
-        validator.validate(ast)  # 先完整校验；此处抛出则不会进入任何推断状态
-        checker = Inferencer()
+    _validate_max_nodes(max_nodes)
+    checker = Inferencer()
+    # 先完整校验；校验抛出则不会构造任何推断状态。
+    validator = ast_mod.AstValidator(max_nodes)
+    with _recursion_room(max_nodes):
+        validator.validate(ast)
         subst, root_t = checker.ti(ast, {}, {}, ())
         # 深类型的替换应用、规范命名与渲染同样是结构递归，留在提限区间内。
         principal = apply(subst, root_t)
         names = canonical_names(principal)
         principal_str = render_type(principal, names)
-    finally:
-        sys.setrecursionlimit(old_limit)
     return InferenceResult(
         principal_type=principal_str,
         type=principal,

@@ -4,26 +4,31 @@
 纯 Python 3.14.7 标准库，零第三方依赖，核心算法（统一、occurs 检查、
 替换组合、泛化）全部从零自实现，不调用任何第三方同类实现。
 
+除普通推断入口 ``infer`` 外，本库在它旁边提供**诊断入口** ``diagnose``：
+推断失败时不再只报“两个位置不合”，而是给出按稳定编号确定的
+**包含极小冲突约束集**，并追踪实例化、替换与统一的来源。
+诊断模式不改变任何类型系统规则（值限制、occurs、语法限制一律不放宽）。
+
 ## 运行环境与命令
 
 - Python：**3.14.7**（Linux 原生；只用标准库，安装 Python 后无需其他依赖）
 - 无需网络、账号、密钥、数据库、中间件、云 API 或 Docker
 
 ```bash
-# 必要测试（在仓库根目录执行）
-python -m unittest discover -s tests -v
+# 必要测试（在仓库根目录执行，含普通回归与诊断专项）
+./.venv/bin/python -m unittest discover -s tests -v
 
-# 固定输入演示：真实计算并打印 1 个主类型 + 1 个实际触发的拒绝
-python demo.py
+# 固定输入演示：真实计算并打印主类型、实际触发的拒绝、以及诊断结果
+./.venv/bin/python demo.py
 ```
 
-demo 不含 `sleep`、不读预录结果、不做压力测试，实测耗时约 0.05 秒
-（上限 8 秒内）。
+demo 不含 `sleep`、不读预录结果、不做压力测试，实测耗时约 0.06 秒
+（上限 90 秒内）。
 
 ## 公开接口
 
 ```python
-from polyinfer import infer, A
+from polyinfer import infer, diagnose, format_diagnosis, A
 from polyinfer.errors import (
     PolytypeError,            # 本库所有错误的基类
     InvalidAstError,          # AST 结构/字面量非法（带 path）
@@ -43,7 +48,19 @@ result.constraints      # 全部统一等式留痕（含两端 AST 路径）
 result.generalizations  # 全部 let 泛化事件留痕
 result.node_count       # AST 节点数
 result.verify()         # 独立替换器逐约束核验（不经过统一核心）
+
+diag = diagnose(ast, max_nodes=500, max_checks=512)   # 诊断模式
+diag.ok                  # True 时 principal_type/result 与 infer 逐字一致
+diag.minimal             # False 时（预算耗尽）不假称极小
+diag.cores               # 一个或多个冲突核（多处独立错误 -> 多核）
+diag.conflict_indices()  # 第一个核的稳定编号，如 (0, 1)
+diag.evidence.kind       # "type-mismatch" | "infinite-type"
+diag.constraints         # 全部带稳定编号的约束（位置/说明/形态/下钻条数）
+diag.instantiation_trace # 使用点 -> let/lambda 来源、多态或单态共享
+diag.provenance(var_id)  # 类型变量的替换来源链（指向编号约束）
+diag.budget_exhausted    # 独立诊断预算是否耗尽
 ```
+
 
 ### AST 数据结构（普通 dict，可 JSON 化）
 
@@ -96,6 +113,84 @@ Ref(a) -> Unit                 λr. r := !r
   临时提高的解释器递归上限在 `try/finally` 中恢复，成功失败都不留下
   全局变更。
 
+## 诊断模式：极小冲突约束集（`polyinfer.diagnose`）
+
+普通 `infer` 失败时只给“第一次统一失败”的两个位置。诊断入口
+`diagnose(ast, max_nodes=500, max_checks=512)` 在它旁边，回答
+“**哪几条输入约束合起来才有问题**”。
+
+```python
+from polyinfer import A, diagnose, format_diagnosis
+
+# λf. if f then (f 1) else 2：
+# f 既要 Bool（if 条件）又要 Int -> a（被应用），两条约束单看都成立，
+# 合起来才矛盾。
+prog = A.lambda_("f",
+        A.if_(A.var("f"), A.apply(A.var("f"), A.int_(1)), A.int_(2)))
+diag = diagnose(prog)
+diag.ok                 # False
+diag.minimal            # True：包含极小（逐条移除验证过）
+diag.conflict_indices() # (0, 1)：#0 与 #1 合起来才冲突
+diag.evidence.kind      # "type-mismatch"；自应用则是 "infinite-type"
+print(format_diagnosis(diag))
+```
+
+### 稳定编号
+
+诊断先做一次**容错遍历**（统一失败不抛出、记录后继续），枚举整棵 AST
+诱导的全部顶层统一等式，按遍历首次出现顺序编号 `#0, #1, …`。每条等式
+以“**两端 AST 路径对**”为稳定身份键——键只取决于 AST 结构，与替换内容
+无关，因此同一程序每次诊断编号一致（测试对同程序多次诊断逐字比对）。
+函数/引用下钻出的子等式（路径后缀 `[arg]`/`[ret]`/`[inner]`）共享所属
+顶层等式的编号。`diag.constraints` 给出每条编号约束的来源位置、说明
+与当时形态；`diag.instantiation_trace` 追踪每个变量使用点实例化自
+哪个 let / lambda 形参（多态新实例还是单态共享）；
+`diag.provenance(变量内部id)` 给出“某类型变量被哪条编号约束绑定成
+什么”的替换来源链。
+
+### 极小化算法（不要求最小基数）
+
+对编号从大到小的每条约束，重放“当前候选集 − 该条”：**删除后仍冲突就
+保留删除**，直到一轮结束。一轮结束后再对最终集合**逐条冻结重放验证**：
+删去其中任意一条都必须可满足——“包含极小（irredundant）”是验证出来的，
+不是口头声明；不声称最小基数（minimum cardinality）。
+
+程序可能有**两处互相独立的错误**：取出一个冲突核后把它整体跳过再重放，
+若仍冲突，则在剩余约束上再跑一轮逆序删除提取下一个核，直到剩余集合
+可满足。例如 `if 1 then 2 else false`（条件错 + 两分支不合）报出两个
+核 `(#0,)`、`(#1,)`。
+
+### 冻结重放与“不放宽限制”
+
+每一次试探都是：**深拷贝冻结的原始 AST** + **全新推断器**（空替换、
+空类型变量计数器、空留痕）。绝不复用上一次失败遍历的并查集或替换；
+“跳过一条约束”意味着该顶层统一及其全部下钻完全不发生。SAT/UNSAT
+一律由**严格**重放判定（依据一阶语法合一定理：可合一则任意处理顺序
+都成功），因此 let 泛化集合在成功前缀的部分最一般解下精确计算——
+**值限制一条不放宽**：共享引用仍不泛化、lambda 形参仍单态，可满足只
+能来自“删掉了冲突等式”，而不是来自更松的类型规则。
+
+### occurs 与普通不合的区分
+
+冲突证据 `diag.evidence.kind` 区分两类：自应用 `λx. x x` 是
+`"infinite-type"`（occurs 检查失败、无限类型）；`if 1 ...`、
+`read 1` 等是 `"type-mismatch"`（构造子不一致）。两者的叶子位置与
+两端类型都保留。
+
+### 独立预算与限制
+
+- 诊断有**独立预算** `max_checks`（默认 512，诊断遍历次数；容错枚举、
+  每次删除试探、逐核成员验证都计数；与 500 节点上限完全无关）。
+  预算耗尽时返回已经找到的核与尚未缩减完的候选，
+  `diag.minimal == False`、`diag.budget_exhausted == True`，
+  并在 `format_diagnosis` 中明确“不宣称极小”——绝不会假称极小。
+- 成功程序的诊断结果 `diag.ok == True`，`diag.principal_type` 与
+  `result` 与普通 `infer` **逐字一致**，且同样通过独立参考检查器。
+- AST 非法、节点超限、未绑定变量等“类型冲突之前”的错误与普通入口
+  一样直接抛出，不会被诊断吞掉。
+- 诊断只使用原有语法与类型系统，**不引入新类型构造、不改变规则**；
+  它是对同一套 HM + 值限制推断的可解释性包装。
+
 ## 设计取舍
 
 1. **值限制（value restriction）**：`let` 仅当绑定表达式是非扩展的
@@ -138,15 +233,17 @@ Ref(a) -> Unit                 λr. r := !r
 
 ```text
 polyinfer/
-  __init__.py    公开接口
+  __init__.py    公开接口（infer 与 diagnose 并列）
   ast.py         AST 构造器与结构/作用域/上限校验
   types.py       类型结构、occurs、apply、bind 替换组合、渲染、规范命名
-  inference.py   Algorithm W 核心、值限制、约束/泛化留痕、infer() 入口
+  inference.py   Algorithm W 核心、值限制、约束/泛化/绑定/实例化留痕、infer()
+  diagnose.py    诊断模式：稳定编号、冻结重放、逆序删除极小化、diagnose()
   reference.py   独立参考检查器（不经过统一核心）
   errors.py      错误类型体系与路径渲染
 tests/           unittest 测试（替换原语、推断、四个验收场景、
-                 输入契约、独立检查器与篡改检测、确定性生成测试）
-demo.py          固定输入演示
+                 输入契约、独立检查器与篡改检测、确定性生成测试、
+                 诊断模式专项：极小核/独立多核/预算/冻结重放/追踪）
+demo.py          固定输入演示（普通推断 + 拒绝边界 + 诊断模式）
 ```
 
 四个验收场景均有对应测试（`tests/test_inference.py`）：
@@ -164,3 +261,12 @@ demo.py          固定输入演示
 - `Unit` 没有字面量，只作为 `write` 的结果类型出现；
 - 无副作用求值语义：本库只做静态类型推断，不解释执行 AST，
   也绝不会用 Python 执行输入 AST。
+
+诊断模式的额外口径：
+
+- 极小化需要至多“约束条数 + 核成员数 + 核数”量级的冻结重放，
+  由独立预算 `max_checks` 封顶；预算耗尽时给未缩减完的证据而非极小核；
+- 冲突核按“逆编号序单轮删除”确定，结果对同一 AST 确定、可复现，
+  但**不保证最小基数**（契约明确只要求包含极小）；
+- 诊断的可满足性结论只依赖严格重放与语法合一定理，容错遍历不参与
+  任何 SAT/UNSAT 判定，因此追踪机制不可能改变推断结论。

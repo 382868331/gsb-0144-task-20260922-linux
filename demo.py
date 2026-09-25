@@ -3,19 +3,22 @@
 
 运行：``python demo.py``
 
-打印两部分：
+打印三部分：
 
 1. 正常推导：组合算子的主类型，以及恒等函数在同一作用域内的
    Int / Bool 两种实例（值限制下 let 多态成立），并用独立替换器
    核验成功推导的全部统一约束；
 2. 实际触发的拒绝：引用多态漏洞程序
    ``let r = ref(λz.z) in r := 1; !r`` 被值限制拒绝，
-   打印失败约束两端的类型与 AST 路径。
+   打印失败约束两端的类型与 AST 路径；
+3. 诊断模式（:func:`polyinfer.diagnose`）：失败时不再只给两个位置，
+   而是给出按稳定编号确定的包含极小冲突集——演示“多条约束合起来
+   才有问题”、两处独立错误，以及 occurs 检查与普通类型不合的区分。
 """
 
 import time
 
-from polyinfer import A, format_path, infer
+from polyinfer import A, diagnose, format_diagnosis, format_path, infer
 from polyinfer.errors import InfiniteTypeError, TypeMismatchError
 
 
@@ -94,8 +97,32 @@ def main() -> None:
         print(f"  变量 {exc.left_type} 不得出现在 {exc.right_type} 中")
         print(f"  路径：{format_path(exc.left_path)} 与 {format_path(exc.right_path)}")
 
-    print("\n演示结束：1 个高阶主类型 + 1 个双实例多态推导成功，")
-    print("引用赋值多态漏洞与自应用无限类型均被真实计算拦截。")
+    # ------------------------------------------------------------ 诊断
+    section("诊断模式：λf. if f then (f 1) else 2 —— 哪几条约束合起来错")
+    multi = A.lambda_(
+        "f",
+        A.if_(A.var("f"), A.apply(A.var("f"), A.int_(1)), A.int_(2)),
+    )
+    print("f 在条件里被当作 Bool，在应用里被当作 Int -> a；")
+    print("两处单独都能成立，是 #0 与 #1 合起来把 f 逼成矛盾类型。\n")
+    t0 = time.perf_counter()
+    diag = diagnose(multi)
+    ms = (time.perf_counter() - t0) * 1000
+    print(format_diagnosis(diag))
+    print(f"  诊断总耗时 : {ms:.2f} ms（真实冻结重放）")
+
+    section("诊断模式：两处独立错误分别报出（if 条件错 + 分支不合）")
+    two_errors = A.if_(A.int_(1), A.int_(2), A.bool_(False))
+    diag2 = diagnose(two_errors)
+    print(format_diagnosis(diag2))
+
+    section("诊断模式：自应用的证据是 occurs 检查失败，不是构造子不合")
+    diag3 = diagnose(A.lambda_("x", A.apply(A.var("x"), A.var("x"))))
+    print(format_diagnosis(diag3))
+
+    print("\n演示结束：正常主类型、引用漏洞/自应用拒绝、以及诊断模式的")
+    print("稳定编号、包含极小冲突集（多条合起来才有问题）、两处独立错误")
+    print("与 occurs/构造子不合的区分均为真实计算结果。")
 
 
 if __name__ == "__main__":
