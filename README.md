@@ -1,8 +1,10 @@
-# polyinfer —— 带值限制的多态类型推断库
+# polyinfer —— 带值限制与 rank-1 签名的多态类型推断库
 
-为离线编程语言工程实现的可复用 Hindley–Milner 类型推断模块（Algorithm W）。
+为离线编程语言工程实现的可复用 Hindley–Milner 类型推断模块（Algorithm W），
+支持在 let 绑定处书写可选的 rank-1 类型签名（显式量化类型变量）。
 纯 Python 3.14.7 标准库，零第三方依赖，核心算法（统一、occurs 检查、
-替换组合、泛化）全部从零自实现，不调用任何第三方同类实现。
+替换组合、泛化、刚性变量签名检查）全部从零自实现，不调用任何第三方
+同类实现。
 
 ## 运行环境与命令
 
@@ -10,15 +12,22 @@
 - 无需网络、账号、密钥、数据库、中间件、云 API 或 Docker
 
 ```bash
+# 准备虚拟环境（可选但推荐；只用标准库，无第三方包可装）
+python3 -m venv .venv
+. .venv/bin/activate
+
 # 必要测试（在仓库根目录执行）
 python -m unittest discover -s tests -v
 
 # 固定输入演示：真实计算并打印 1 个主类型 + 1 个实际触发的拒绝
 python demo.py
+
+# 本轮迭代演示：rank-1 签名的正常推导与三类签名错误
+python demo_iteration.py
 ```
 
-demo 不含 `sleep`、不读预录结果、不做压力测试，实测耗时约 0.05 秒
-（上限 8 秒内）。
+demo 不含 `sleep`、不读预录结果、不做压力测试；demo.py 实测约 0.05 秒，
+demo_iteration.py 实测约 0.04 秒（均远低于 90 秒上限）。
 
 ## 公开接口
 
@@ -31,6 +40,10 @@ from polyinfer.errors import (
     UnboundVariableError,     # 未绑定变量（含递归 let）（带 path）
     TypeMismatchError,        # 统一失败：构造子冲突，已证明无解
     InfiniteTypeError,        # 统一失败：occurs 检查，已证明无限类型
+    SignatureError,           # 签名相关错误基类（带 let 位置 path 与绑定名 name）
+    SignatureMismatchError,   # 实现类型与签名不一致（含两端路径）
+    RigidEscapeError,         # 签名刚性变量逃逸出作用域
+    ValueRestrictionConflictError,  # 扩展式 + 多态签名的值限制冲突
     format_path,              # 路径元组 -> "<root>/body/fn"
 )
 
@@ -62,6 +75,32 @@ result.verify()         # 独立替换器逐约束核验（不经过统一核心
 
 构造器见 `polyinfer.ast`（别名 `A`）：`A.var/int_/bool_/lambda_/apply/
 let/if_/ref/read/write_`。手写同构 dict 亦可，入口会做完整结构校验。
+
+### rank-1 类型签名（let 的可选 `sig` 字段）
+
+```python
+A.let("id", A.lambda_("x", A.var("x")), body,
+      sig=A.sig(["a"], A.tfun(A.tvar("a"), A.tvar("a"))))  # forall a. a -> a
+```
+
+签名是普通 dict：`{"forall": ["a", ...], "type": <SigType>}`，
+`SigType` 由 `A.tvar/tcon/tfun/tref` 构造（`tcon` 限
+`Int/Bool/Unit`）。规则：
+
+* **可选**：不写 `sig` 时保持原推断，行为与上一版完全一致；
+* **rank-1**：量化只在最外层，签名类型内部不能再出现 `forall`；
+* **刚性检查**：`forall` 量化的变量在检查函数体时是刚性的——只能
+  等于自身，被统一成具体类型或另一个刚性变量即
+  `SignatureMismatchError`（实现没有签名声称的那么一般）；
+* **可以更具体**：`let f : Int -> Int = λx.x` 合法（无变量签名只做
+  普通统一，结果单态化）；
+* **作用域不越界**：签名变量只属于本签名；刚性变量若被统一进外层
+  环境（如捕获外层 lambda 的单态参数）或出现在 let 结果类型中，
+  报 `RigidEscapeError`；签名里出现未被本签名量化的变量名在
+  结构校验阶段即 `InvalidAstError`；
+* **值限制**：签名含量化变量而绑定表达式是扩展式
+  （`ref/apply/read/write/if`）时报 `ValueRestrictionConflictError`——
+  单态引用不得包装成可任意实例化的多态值。
 
 ### 类型
 
@@ -122,6 +161,9 @@ Ref(a) -> Unit                 λr. r := !r
   **全部**记录约束后两端结构同构；每条 let 的泛化集合恰为
   “绑定类型自由变量 − 环境自由变量”，并由检查器依据绑定表达式 tag
   独立重判值限制（不信任核心字段）。
+- 对带签名的 let 额外核验：绑定类型在最终替换下与签名类型结构
+  同构；泛化集合恰为签名刚性变量集；刚性变量不出现在环境自由
+  变量中（未逃逸）。
 - 测试包含对结果（约束、替换、循环、occurs、泛化集合、值限制标记）
   的**篡改检测**，证明检查器确实在独立审计；另有固定种子的良构项
   生成器做补充测试。主类型期望值均为手写，往返一致仅作补充。
@@ -139,14 +181,17 @@ Ref(a) -> Unit                 λr. r := !r
 ```text
 polyinfer/
   __init__.py    公开接口
-  ast.py         AST 构造器与结构/作用域/上限校验
+  ast.py         AST 与签名构造器、结构/作用域/上限校验
   types.py       类型结构、occurs、apply、bind 替换组合、渲染、规范命名
-  inference.py   Algorithm W 核心、值限制、约束/泛化留痕、infer() 入口
-  reference.py   独立参考检查器（不经过统一核心）
+  inference.py   Algorithm W 核心、值限制、rank-1 签名刚性检查、
+                 约束/泛化留痕、infer() 入口
+  reference.py   独立参考检查器（不经过统一核心，含签名事件复核）
   errors.py      错误类型体系与路径渲染
 tests/           unittest 测试（替换原语、推断、四个验收场景、
-                 输入契约、独立检查器与篡改检测、确定性生成测试）
+                 输入契约、独立检查器与篡改检测、确定性生成测试、
+                 rank-1 签名：恒等双实例、闭包捕获、引用反例）
 demo.py          固定输入演示
+demo_iteration.py  rank-1 签名演示（正常 + 三类签名错误）
 ```
 
 四个验收场景均有对应测试（`tests/test_inference.py`）：
@@ -155,7 +200,10 @@ demo.py          固定输入演示
 
 ## 已知限制（只按本契约实现，不宣称行业标准完整兼容）
 
-- 不含递归 let/递归函数、多态递归、类型标注与用户给定类型方案；
+- 不含递归 let/递归函数、多态递归；
+- 签名仅限 **rank-1**（最外层量化）：不支持高阶多态
+  （如 `forall f. ...` 嵌在参数位置）、类型标注表达式、
+  lambda 参数标注；
 - 不含词法/语法解析器——输入是结构化 AST；
 - 只有 `Int`/`Bool`/`Unit` 与函数、引用，不含元组、列表、变体、
   记录、ADT、kinding、行多态、高阶多态（`∀f. …`）等；

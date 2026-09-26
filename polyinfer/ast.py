@@ -19,6 +19,19 @@ tag                字段
 
 构造器 :func:`var` ... :func:`write_` 只做最薄的一层封装，便于手写
 示例与测试；所有硬校验集中在 :class:`AstValidator`，``infer`` 入口会调用。
+
+类型签名（``let`` 的可选 ``sig`` 字段）也是普通 dict::
+
+    {"forall": ["a", "b"], "type": <SigType>}
+
+其中 ``<SigType>`` 递归定义为：
+
+    - ``tvar``: ``name: str``（必须出现在 ``forall`` 列表里）
+    - ``tcon``: ``name: str``（``Int`` / ``Bool`` / ``Unit``）
+    - ``tfun``: ``arg``, ``ret``
+    - ``tref``: ``inner``
+
+签名是 rank-1 的：量化只发生在最外层，签名类型内部不出现 ``forall``。
 """
 
 from __future__ import annotations
@@ -45,6 +58,16 @@ NODE_FIELDS: Dict[str, Tuple[str, ...]] = {
 Node = Dict[str, Any]
 Path = Tuple[str, ...]
 
+# 签名类型（SigType）节点种类 -> 必需字段。
+SIG_TYPE_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "tvar": ("name",),
+    "tcon": ("name",),
+    "tfun": ("arg", "ret"),
+    "tref": ("inner",),
+}
+
+SIG_CON_NAMES = frozenset({"Int", "Bool", "Unit"})
+
 
 # ---------------------------------------------------------------- 构造器
 
@@ -68,8 +91,11 @@ def apply(fn: Node, arg: Node) -> Node:
     return {"tag": "apply", "fn": fn, "arg": arg}
 
 
-def let(name: str, bound: Node, body: Node) -> Node:
-    return {"tag": "let", "name": name, "bound": bound, "body": body}
+def let(name: str, bound: Node, body: Node, sig: "Node | None" = None) -> Node:
+    node: Node = {"tag": "let", "name": name, "bound": bound, "body": body}
+    if sig is not None:
+        node["sig"] = sig
+    return node
 
 
 def if_(cond: Node, then: Node, else_: Node) -> Node:
@@ -86,6 +112,29 @@ def read(ref_node: Node) -> Node:
 
 def write_(ref_node: Node, value: Node) -> Node:
     return {"tag": "write", "ref": ref_node, "value": value}
+
+
+# ------------------------------------------------------- 签名构造器
+
+def sig(quantified, sig_type: Node) -> Node:
+    """rank-1 签名：forall quantified . sig_type。"""
+    return {"forall": list(quantified), "type": sig_type}
+
+
+def tvar(name: str) -> Node:
+    return {"tag": "tvar", "name": name}
+
+
+def tcon(name: str) -> Node:
+    return {"tag": "tcon", "name": name}
+
+
+def tfun(arg: Node, ret: Node) -> Node:
+    return {"tag": "tfun", "arg": arg, "ret": ret}
+
+
+def tref(inner: Node) -> Node:
+    return {"tag": "tref", "inner": inner}
 
 
 # ---------------------------------------------------------------- 校验
@@ -126,7 +175,10 @@ class AstValidator:
         fields = NODE_FIELDS.get(tag)
         if fields is None:
             self._fail(path, f"未知节点 tag {tag!r}")
-        extra = set(node) - {"tag", *fields}
+        allowed = {"tag", *fields}
+        if tag == "let":
+            allowed.add("sig")  # let 可携带可选的 rank-1 类型签名
+        extra = set(node) - allowed
         if extra:
             self._fail(path, f"存在多余字段 {sorted(extra)}；{tag} 节点只允许 {list(fields)}")
         missing = [f for f in fields if f not in node]
@@ -156,6 +208,8 @@ class AstValidator:
         elif tag in ("lambda", "let"):
             name_field = "param" if tag == "lambda" else "name"
             self._check_name(path, node[name_field])
+        if tag == "let" and "sig" in node:
+            self._check_sig(node["sig"], path + ("sig",))
         # let 的非递归检查在绑定子树的 scope 处理里完成。
 
         # 递归校验子节点
@@ -198,3 +252,67 @@ class AstValidator:
             self._fail(path, f"'int' 节点只接受 int，float 不会被隐式截断（实际 {value!r}）")
         if not isinstance(value, int):
             self._fail(path, f"'int' 节点的 value 必须是 int，实际得到 {type(value).__name__}")
+
+    # -- 类型签名 -----------------------------------------------------------
+
+    def _check_sig(self, sig_node: Any, path: Path) -> None:
+        """校验 rank-1 签名结构：{"forall": [...], "type": <SigType>}。
+
+        签名里出现的每个类型变量名都必须被本签名的 forall 量化——
+        类型变量的作用域就是这一处签名，不能穿过相邻绑定。
+        """
+        if not isinstance(sig_node, dict):
+            self._fail(path, f"签名必须是 dict，实际得到 {type(sig_node).__name__}")
+        extra = set(sig_node) - {"forall", "type"}
+        if extra:
+            self._fail(path, f"签名存在多余字段 {sorted(extra)}；只允许 'forall' 与 'type'")
+        for field in ("forall", "type"):
+            if field not in sig_node:
+                self._fail(path, f"签名缺少字段 {field!r}")
+        quantified = sig_node["forall"]
+        if not isinstance(quantified, (list, tuple)):
+            self._fail(path + ("forall",), f"'forall' 必须是名字列表，实际得到 {type(quantified).__name__}")
+        seen = set()
+        for qname in quantified:
+            self._check_name(path + ("forall",), qname)
+            if qname in seen:
+                self._fail(path + ("forall",), f"量化变量 {qname!r} 重复")
+            seen.add(qname)
+        self._check_sig_type(sig_node["type"], path + ("type",), seen)
+
+    def _check_sig_type(self, node: Any, path: Path, quantified: set) -> None:
+        if not isinstance(node, dict):
+            self._fail(path, f"签名类型节点必须是 dict，实际得到 {type(node).__name__}")
+        tag = node.get("tag")
+        fields = SIG_TYPE_FIELDS.get(tag)
+        if fields is None:
+            self._fail(path, f"未知签名类型 tag {tag!r}（签名是 rank-1，类型内不允许嵌套 forall）")
+        extra = set(node) - {"tag", *fields}
+        if extra:
+            self._fail(path, f"存在多余字段 {sorted(extra)}；{tag} 节点只允许 {list(fields)}")
+        missing = [f for f in fields if f not in node]
+        if missing:
+            self._fail(path, f"缺少字段 {missing}")
+        self.count += 1
+        if self.count > self.max_nodes:
+            from .errors import NodeLimitError
+
+            raise NodeLimitError(self.count, self.max_nodes)
+        if tag == "tvar":
+            name = node["name"]
+            self._check_name(path, name)
+            if name not in quantified:
+                self._fail(
+                    path,
+                    f"签名类型变量 {name!r} 未被本签名的 'forall' 量化；"
+                    "类型变量作用域仅限本签名，不能引用外层绑定的变量",
+                )
+        elif tag == "tcon":
+            name = node["name"]
+            if name not in SIG_CON_NAMES:
+                self._fail(path, f"未知基础类型 {name!r}，只允许 {sorted(SIG_CON_NAMES)}")
+        elif tag == "tfun":
+            self._check_sig_type(node["arg"], path + ("arg",), quantified)
+            self._check_sig_type(node["ret"], path + ("ret",), quantified)
+        elif tag == "tref":
+            self._check_sig_type(node["inner"], path + ("inner",), quantified)

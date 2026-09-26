@@ -16,6 +16,13 @@
 3. **泛化合法**：每条 let 记录中，核心声称的泛化集合恰好等于
    “绑定类型自由变量 − 环境自由变量”；扩展式必须空泛化（值限制）。
 
+对带 rank-1 签名的 let 额外核验（同样只用自带的替换应用与结构
+同构判定，不借用待测统一器）：
+
+4. **签名一致**：绑定类型在最终替换下必须与签名类型结构同构；
+5. **刚性集合**：泛化集合恰为签名类型的自由变量（刚性变量集合），
+   且这些刚性变量不出现在环境自由变量中（未逃逸）。
+
 检查失败抛 :class:`ReferenceCheckFailure`，这表示核心（或被篡改的结果）
 有 bug，而不是被测程序不可类型化——后者在 ``infer`` 阶段就已抛出。
 """
@@ -153,6 +160,30 @@ def check_result(result: Any) -> RefCheckReport:
                 f"独立重算（{g.bound_tag} 是{'值' if is_value else '扩展式'}）"
                 f"应为 {sorted(v.ident for v in expected)}"
             )
+        sig_type = getattr(g, "sig_type", None)
+        if sig_type is not None:
+            # 4) 实现类型在最终替换下必须与签名类型结构同构。
+            bound_final = ref_apply(subst, g.bound_type)
+            try:
+                ref_isomorphic(bound_final, sig_type, f"signature[{g.name}]")
+            except ReferenceCheckFailure as exc:
+                raise ReferenceCheckFailure(
+                    f"let {g.name!r} @ {g.path} 的实现类型与签名不一致：{exc}"
+                ) from exc
+            # 5) 泛化集合恰为签名刚性变量，且刚性变量未逃逸进环境。
+            sig_free = ref_free_vars(sig_type)
+            if actual != sig_free:
+                raise ReferenceCheckFailure(
+                    f"let {g.name!r} @ {g.path} 泛化集合不等于签名刚性变量集："
+                    f"核心给出 {sorted(v.ident for v in actual)}，"
+                    f"签名为 {sorted(v.ident for v in sig_free)}"
+                )
+            leaked = env_free & sig_free
+            if leaked:
+                raise ReferenceCheckFailure(
+                    f"let {g.name!r} @ {g.path} 的刚性变量逃逸进环境："
+                    f"{sorted(v.ident for v in leaked)}"
+                )
 
     return RefCheckReport(
         constraints_checked=len(result.constraints),

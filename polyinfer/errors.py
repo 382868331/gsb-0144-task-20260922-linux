@@ -108,3 +108,69 @@ class InfiniteTypeError(UnificationError):
             expanded,
             f"无限类型：{variable} 出现在 {expanded} 中",
         )
+
+
+# ------------------------------------------------------------ 签名检查错误
+
+
+class SignatureError(PolytypeError):
+    """let 绑定上的 rank-1 类型签名相关错误的公共基类。"""
+
+    def __init__(self, path: Path, name: str, message: str) -> None:
+        self.path = path          # let 节点位置
+        self.name = name          # 被绑定的名字
+        self.message = message
+        super().__init__(f"签名错误（let {name!r}，位置 {format_path(path)}）：{message}")
+
+
+class SignatureMismatchError(SignatureError):
+    """绑定表达式的类型与签名声称的类型对不上。"""
+
+    def __init__(
+        self,
+        path: Path,
+        name: str,
+        left_path: Path,
+        right_path: Path,
+        left_type: Any,
+        right_type: Any,
+        detail: str,
+    ) -> None:
+        self.left_path = left_path
+        self.right_path = right_path
+        self.left_type = left_type
+        self.right_type = right_type
+        super().__init__(
+            path,
+            name,
+            f"签名与实现不匹配（{detail}）：左端 {left_type} @ "
+            f"{format_path(left_path)}；右端 {right_type} @ {format_path(right_path)}",
+        )
+
+
+class RigidEscapeError(SignatureError):
+    """签名量化的刚性变量逃逸到签名作用域之外。"""
+
+    def __init__(self, path: Path, name: str, variable: str, where: str) -> None:
+        self.variable = variable
+        self.where = where
+        super().__init__(
+            path,
+            name,
+            f"刚性变量 {variable!r} 逃逸出签名作用域（出现在{where}）；"
+            "签名量化的类型变量不能穿过相邻/外层绑定",
+        )
+
+
+class ValueRestrictionConflictError(SignatureError):
+    """签名要求泛化（含量化变量），但绑定表达式是扩展式。"""
+
+    def __init__(self, path: Path, name: str, bound_tag: str, quantified: Tuple[str, ...]) -> None:
+        self.bound_tag = bound_tag
+        self.quantified = tuple(quantified)
+        super().__init__(
+            path,
+            name,
+            f"签名量化了 {list(quantified)}，但绑定表达式是扩展式 "
+            f"{bound_tag!r}；值限制不允许对其泛化",
+        )

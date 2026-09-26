@@ -31,8 +31,12 @@ from typing import Dict, List, Tuple
 from . import ast as ast_mod
 from .errors import (
     InfiniteTypeError,
+    RigidEscapeError,
+    SignatureMismatchError,
     TypeMismatchError,
     UnboundVariableError,
+    UnificationError,
+    ValueRestrictionConflictError,
 )
 from .types import (
     BOOL,
@@ -97,6 +101,10 @@ class Generalization:
     bound_type: Type
     generalized: Tuple[TVar, ...]
     env_snapshot: Tuple[Tuple[str, frozenset, Type], ...]
+    # 若该 let 带 rank-1 签名：签名的量化变量名与（刚性化后的）签名类型；
+    # 独立检查器据此复核“实现类型 ≡ 签名类型”且刚性变量未逃逸。
+    sig_quantified: Tuple[str, ...] = ()
+    sig_type: "Type | None" = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +140,9 @@ class Inferencer:
         self._counter = count()
         self.constraints: List[Constraint] = []
         self.generalizations: List[Generalization] = []
+        # 刚性（签名量化）类型变量：ident -> (签名变量名, let 名, let 路径)。
+        # 刚性变量在检查函数体期间不可被统一成任何具体类型。
+        self._rigid: Dict[int, Tuple[str, str, Path]] = {}
 
     # ------------------------------------------------------------ 工具
 
@@ -163,6 +174,11 @@ class Inferencer:
         l = apply(s, left)
         r = apply(s, right)
         self.constraints.append(Constraint(l, r, left_path, right_path, note))
+
+        l_rigid = isinstance(l, TVar) and l.ident in self._rigid
+        r_rigid = isinstance(r, TVar) and r.ident in self._rigid
+        if l_rigid or r_rigid:
+            return self._unify_rigid(s, l, r, left_path, right_path, note)
 
         if isinstance(l, TVar):
             if isinstance(r, TVar) and l == r:
@@ -212,6 +228,39 @@ class Inferencer:
 
         raise TypeMismatchError(left_path, right_path, l, r)
 
+    def _unify_rigid(self, s, l, r, left_path, right_path, note):
+        """至少一端是刚性变量的统一。
+
+        * 刚性变量 = 自身：成功；
+        * 刚性变量 = 非刚性变量：把非刚性变量绑定到刚性变量（合法，
+          是否逃逸由 let 结束时的逃逸检查判定）；
+        * 刚性变量 = 具体类型或另一个刚性变量：实现没有签名声称的
+          那么一般，报 :class:`SignatureMismatchError`。
+        """
+        if isinstance(l, TVar) and isinstance(r, TVar):
+            if l == r:
+                return s
+            rigid_var = l if l.ident in self._rigid else r
+            other = r if rigid_var is l else l
+            if other.ident in self._rigid:
+                self._raise_rigid_mismatch(rigid_var, left_path, right_path, l, r, note)
+            return bind(s, other, rigid_var)
+        rigid_var = l if isinstance(l, TVar) else r
+        self._raise_rigid_mismatch(rigid_var, left_path, right_path, l, r, note)
+
+    def _raise_rigid_mismatch(self, rigid_var, left_path, right_path, l, r, note):
+        qname, let_name, let_path = self._rigid[rigid_var.ident]
+        raise SignatureMismatchError(
+            let_path,
+            let_name,
+            left_path,
+            right_path,
+            l,
+            r,
+            f"签名量化的刚性变量 {qname!r} 被迫等于 {r if rigid_var is l else l}"
+            f"（{note}）；实现没有签名声称的那么一般",
+        )
+
     # ------------------------------------------------------------ 规则
 
     def ti(self, node: ast_mod.Node, env: Dict[str, TypeScheme], s: Subst, path: Path):
@@ -258,6 +307,9 @@ class Inferencer:
         return s3, apply(s3, ret_var)
 
     def _ti_let(self, node, env, s, path):
+        sig_node = node.get("sig")
+        if sig_node is not None:
+            return self._ti_let_signed(node, env, s, path, sig_node)
         s1, bound_raw = self.ti(node["bound"], env, s, path + ("bound",))
         bound_t = apply(s1, bound_raw)
         name = node["name"]
@@ -290,6 +342,94 @@ class Inferencer:
         body_env[name] = scheme
         s2, body_t = self.ti(node["body"], body_env, s1, path + ("body",))
         return s2, body_t
+
+    def _ti_let_signed(self, node, env, s, path, sig_node):
+        """带 rank-1 签名的 let：先约定类型，再按刚性变量检查实现。
+
+        步骤：
+
+        1. 值限制：签名含量化变量而绑定是扩展式 → 值限制冲突
+           （不允许把单态引用等包装成可任意实例化的多态值）；
+        2. 为每个量化名分配全新的刚性类型变量，把签名类型刚性化；
+        3. 正常推断绑定表达式，再把其类型与刚性化签名统一——
+           刚性变量只可被“等于自身”，否则签名不匹配；
+        4. 绑定体按签名方案（量化刚性变量）入环境推断；
+        5. 逃逸检查：刚性变量不得出现在外层环境或 let 结果类型中，
+           即类型变量作用域不穿过相邻/外层绑定。
+        """
+        name = node["name"]
+        bound_tag = node["bound"]["tag"]
+        quantified_names = tuple(sig_node["forall"])
+
+        if quantified_names and bound_tag not in _VALUE_TAGS:
+            raise ValueRestrictionConflictError(path, name, bound_tag, quantified_names)
+
+        rigid_map: Dict[str, TVar] = {}
+        for qname in quantified_names:
+            var = self.fresh()
+            rigid_map[qname] = var
+            self._rigid[var.ident] = (qname, name, path)
+        sig_type = _build_sig_type(sig_node["type"], rigid_map)
+
+        s1, bound_raw = self.ti(node["bound"], env, s, path + ("bound",))
+        bound_t = apply(s1, bound_raw)
+        try:
+            s2 = self.unify(
+                s1,
+                bound_t,
+                sig_type,
+                path + ("bound",),
+                path + ("sig",),
+                "let 签名要求实现类型与签名一致",
+            )
+        except UnificationError as exc:
+            raise SignatureMismatchError(
+                path,
+                name,
+                exc.left_path,
+                exc.right_path,
+                exc.left_type,
+                exc.right_type,
+                "实现类型无法与签名统一",
+            ) from exc
+
+        rigid_vars = tuple(rigid_map.values())
+        rigid_idents = {v.ident for v in rigid_vars}
+        scheme = TypeScheme(frozenset(rigid_vars), sig_type)
+
+        self.generalizations.append(
+            Generalization(
+                path=path,
+                name=name,
+                bound_tag=bound_tag,
+                bound_type=bound_t,
+                generalized=rigid_vars,
+                env_snapshot=tuple(
+                    (ename, esch.quantified, apply(s2, esch.t))
+                    for ename, esch in env.items()
+                ),
+                sig_quantified=quantified_names,
+                sig_type=sig_type,
+            )
+        )
+
+        body_env = dict(env)
+        body_env[name] = scheme
+        s3, body_t = self.ti(node["body"], body_env, s2, path + ("body",))
+
+        # 逃逸检查：刚性变量的作用域仅限本绑定。
+        for ename, esch in env.items():
+            for v in free_tvars(apply(s3, esch.t)):
+                if v.ident in rigid_idents and v not in esch.quantified:
+                    qname = self._rigid[v.ident][0]
+                    raise RigidEscapeError(
+                        path, name, qname, f"外层环境变量 {ename!r} 的类型中"
+                    )
+        for v in free_tvars(apply(s3, body_t)):
+            if v.ident in rigid_idents:
+                qname = self._rigid[v.ident][0]
+                raise RigidEscapeError(path, name, qname, "let 表达式的结果类型中")
+        return s3, body_t
 
     def _ti_if(self, node, env, s, path):
         s1, cond_t = self.ti(node["cond"], env, s, path + ("cond",))
@@ -368,6 +508,22 @@ def _rename(tp: Type, mapping: Dict[TVar, TVar]) -> Type:
     if isinstance(tp, TRef):
         return TRef(_rename(tp.inner, mapping))
     return tp
+
+
+def _build_sig_type(node: ast_mod.Node, rigid_map: Dict[str, TVar]) -> Type:
+    """把签名类型 AST 转成类型；量化名映射到刚性变量。"""
+    tag = node["tag"]
+    if tag == "tvar":
+        return rigid_map[node["name"]]
+    if tag == "tcon":
+        return {"Int": INT, "Bool": BOOL, "Unit": UNIT}[node["name"]]
+    if tag == "tfun":
+        return TFun(
+            _build_sig_type(node["arg"], rigid_map),
+            _build_sig_type(node["ret"], rigid_map),
+        )
+    # tag == "tref"（校验阶段已排除其他可能）
+    return TRef(_build_sig_type(node["inner"], rigid_map))
 
 
 def _env_free_vars(env: Dict[str, TypeScheme], s: Subst):

@@ -23,8 +23,12 @@ from .errors import (
     InvalidAstError,
     NodeLimitError,
     PolytypeError,
+    RigidEscapeError,
+    SignatureError,
+    SignatureMismatchError,
     TypeMismatchError,
     UnboundVariableError,
+    ValueRestrictionConflictError,
     format_path,
 )
 from .inference import (
@@ -64,6 +68,10 @@ __all__ = [
     "UnboundVariableError",
     "TypeMismatchError",
     "InfiniteTypeError",
+    "SignatureError",
+    "SignatureMismatchError",
+    "RigidEscapeError",
+    "ValueRestrictionConflictError",
     "format_path",
     "Type",
     "TVar",
@@ -77,4 +85,4 @@ __all__ = [
     "canonical_names",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
