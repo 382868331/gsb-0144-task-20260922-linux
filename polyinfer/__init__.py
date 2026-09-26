@@ -19,12 +19,15 @@
 
 from . import ast as A
 from .errors import (
+    EscapedRigidVariableError,
     InfiniteTypeError,
     InvalidAstError,
     NodeLimitError,
     PolytypeError,
+    SignatureMismatchError,
     TypeMismatchError,
     UnboundVariableError,
+    ValueRestrictionConflictError,
     format_path,
 )
 from .inference import (
@@ -35,6 +38,7 @@ from .inference import (
     infer,
 )
 from .reference import RefCheckReport, ReferenceCheckFailure, check_result
+from .signature import ParsedSignature, build_signature_type, parse_signature
 from .types import (
     BOOL,
     INT,
@@ -43,6 +47,7 @@ from .types import (
     TFun,
     TRef,
     TVar,
+    RigidTVar,
     Type,
     canonical_names,
     render_type,
@@ -64,9 +69,13 @@ __all__ = [
     "UnboundVariableError",
     "TypeMismatchError",
     "InfiniteTypeError",
+    "SignatureMismatchError",
+    "EscapedRigidVariableError",
+    "ValueRestrictionConflictError",
     "format_path",
     "Type",
     "TVar",
+    "RigidTVar",
     "TCon",
     "TFun",
     "TRef",
@@ -75,6 +84,9 @@ __all__ = [
     "UNIT",
     "render_type",
     "canonical_names",
+    "parse_signature",
+    "build_signature_type",
+    "ParsedSignature",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

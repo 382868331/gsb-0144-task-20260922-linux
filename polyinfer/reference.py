@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Set
 
 from .errors import PolytypeError
-from .types import TCon, TFun, TRef, TVar, Type
+from .types import RigidTVar, TCon, TFun, TRef, TVar, Type
 
 
 class ReferenceCheckFailure(PolytypeError):
@@ -144,8 +144,26 @@ def check_result(result: Any) -> RefCheckReport:
         for _ename, quantified, body in g.env_snapshot:
             body_free = ref_free_vars(ref_apply(subst, body))
             env_free |= body_free - set(quantified)
-        expected = (bound_free - env_free) if is_value else set()
         actual = set(g.generalized)
+        if getattr(g, "signed", False):
+            # 显式签名绑定：普通推断泛化必须为空；刚性变量记录在
+            # rigid_vars 上，且签名中每个刚性变量在最终替换后仍“存活”，
+            # 扩展式（值限制冲突）则必须一个刚性变量都不剩。
+            expected = set()
+            surviving = {ref_apply(subst, r) for r in getattr(g, "rigid_vars", ())}
+            surviving = {v for v in surviving if isinstance(v, RigidTVar)}
+            if not is_value and surviving:
+                raise ReferenceCheckFailure(
+                    f"带签名 let {g.name!r} @ {g.path} 是扩展式 {g.bound_tag!r}，"
+                    f"却保留了 {len(surviving)} 个刚性变量（值限制冲突未被拦截）"
+                )
+            if actual != expected:
+                raise ReferenceCheckFailure(
+                    f"带签名 let {g.name!r} @ {g.path} 不应有普通推断泛化，"
+                    f"实际为 {sorted(v.ident for v in actual)}"
+                )
+            continue
+        expected = (bound_free - env_free) if is_value else set()
         if actual != expected:
             raise ReferenceCheckFailure(
                 f"let {g.name!r} @ {g.path} 泛化集合不合法："

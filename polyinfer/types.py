@@ -47,6 +47,25 @@ class TVar(Type):
         yield self
 
 
+@dataclass(frozen=True, eq=False)
+class RigidTVar(TVar):
+    """显式签名里 ``forall`` 引入的刚性（skolem）类型变量。
+
+    刚性变量在其签名检查期间只能与自身统一：任何把它实例化成具体
+    类型、与另一个刚性变量合并、或经外层推断变量“逃逸”出绑定的
+    做法都必须被拒绝。``eq=False`` 使它绝不与普通 :class:`TVar`
+    判等，避免被替换映射误吞。
+    """
+
+    name: str = "?"
+
+    def __eq__(self, other: object) -> bool:  # 只允许自身（按 ident）相等
+        return isinstance(other, RigidTVar) and other.ident == self.ident
+
+    def __hash__(self) -> int:
+        return hash((RigidTVar, self.ident))
+
+
 @dataclass(frozen=True)
 class TCon(Type):
     """零元类型构造子。"""
@@ -146,6 +165,8 @@ class TypeRenderer:
         return self._render(self.tp, top=True)
 
     def _name(self, var: TVar) -> str:
+        if isinstance(var, RigidTVar):
+            return self.names.get(var, var.name)
         return self.names.get(var, f"?{var.ident}")
 
     def _render(self, tp: Type, top: bool = False) -> str:

@@ -30,10 +30,14 @@ from typing import Dict, List, Tuple
 
 from . import ast as ast_mod
 from .errors import (
+    EscapedRigidVariableError,
     InfiniteTypeError,
+    SignatureMismatchError,
     TypeMismatchError,
     UnboundVariableError,
+    ValueRestrictionConflictError,
 )
+from .signature import build_signature_type, parse_signature
 from .types import (
     BOOL,
     INT,
@@ -51,6 +55,7 @@ from .types import (
     occurs,
     render_type,
 )
+from .types import RigidTVar
 
 Path = Tuple[str, ...]
 
@@ -97,6 +102,9 @@ class Generalization:
     bound_type: Type
     generalized: Tuple[TVar, ...]
     env_snapshot: Tuple[Tuple[str, frozenset, Type], ...]
+    signed: bool = False
+    signature_text: str = ""
+    rigid_vars: Tuple[TVar, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -132,11 +140,17 @@ class Inferencer:
         self._counter = count()
         self.constraints: List[Constraint] = []
         self.generalizations: List[Generalization] = []
+        # 当前正在检查的签名引入的刚性变量集合（用于错误归类）。
+        # 当前正在检查的签名上下文栈：(let 路径, 名字, 签名文本, 刚性集合)。
+        self.active_sigs: list = []
 
     # ------------------------------------------------------------ 工具
 
     def fresh(self) -> TVar:
         return TVar(next(self._counter))
+
+    def fresh_rigid(self, name: str) -> RigidTVar:
+        return RigidTVar(next(self._counter), name)
 
     def instantiate(self, scheme: TypeScheme) -> Type:
         """实例化类型方案：每个被限定变量换一个全新类型变量。"""
@@ -164,22 +178,15 @@ class Inferencer:
         r = apply(s, right)
         self.constraints.append(Constraint(l, r, left_path, right_path, note))
 
-        if isinstance(l, TVar):
-            if isinstance(r, TVar) and l == r:
-                return s
-            # 检查 l 是否出现在 r 中（occurs 检查，防止无限类型）。
-            if occurs(l, r):
-                raise InfiniteTypeError(left_path, right_path, l, r)
-            return bind(s, l, r)
-        if isinstance(r, TVar):
-            if occurs(r, l):
-                raise InfiniteTypeError(right_path, left_path, r, l)
-            return bind(s, r, l)
+        if isinstance(l, TVar) or isinstance(r, TVar):
+            if isinstance(l, TVar):
+                return self._unify_var(s, l, r, left_path, right_path)
+            return self._unify_var(s, r, l, right_path, left_path)
 
         if isinstance(l, TCon) and isinstance(r, TCon):
             if l.name == r.name:
                 return s
-            raise TypeMismatchError(left_path, right_path, l, r)
+            raise self._sig_or_mismatch(left_path, right_path, l, r, infinite=False)
 
         if isinstance(l, TFun) and isinstance(r, TFun):
             s1 = self.unify(
@@ -210,7 +217,59 @@ class Inferencer:
                 f"{note}：引用单元",
             )
 
-        raise TypeMismatchError(left_path, right_path, l, r)
+        raise self._sig_or_mismatch(left_path, right_path, l, r, infinite=False)
+
+    def _unify_var(self, s: Subst, va: Type, other: Type, va_path: Path, other_path: Path,
+                   ) -> Subst:
+        """统一其中一侧为（已解析的）类型变量的情形。
+
+        刚性变量（显式签名的 skolem）只能与自身或普通推断变量统一：
+        不能实例化成具体类型，也不能与另一个不同的刚性变量合并。
+        ``swap`` 仅用于交换路径方向，等式对称。
+        """
+        if isinstance(other, TVar):
+            if va == other:
+                return s
+            va_rigid = isinstance(va, RigidTVar)
+            other_rigid = isinstance(other, RigidTVar)
+            if va_rigid and other_rigid:
+                raise self._sig_or_mismatch(va_path, other_path, va, other, infinite=False)
+            # 刚性 ↔ 普通变量：允许普通变量绑定到刚性（方向取普通变量为键）。
+            if va_rigid:
+                if occurs(other, va):
+                    raise InfiniteTypeError(other_path, va_path, other, va)
+                return bind(s, other, va)
+            if other_rigid:
+                if occurs(va, other):
+                    raise InfiniteTypeError(va_path, other_path, va, other)
+                return bind(s, va, other)
+            if occurs(va, other):
+                raise InfiniteTypeError(va_path, other_path, va, other)
+            return bind(s, va, other)
+        # 刚性变量在签名检查中充当 skolem 目标：
+        # 允许实现侧的自由推断变量经统一把它替换成复合类型
+        #（实现比签名更一般，如实现 b->b、签名 a）；真正的危险
+        # （被外层单态吞并、扩展式泛化）由逃逸检查与值限制检查拦截。
+        if isinstance(va, RigidTVar) and not isinstance(other, TVar) and not free_tvars(other):
+            # 刚性变量与不含推断变量的具体复合类型冲突（a ≠ Int/Bool/具体函数）。
+            # 含自由推断变量的复合类型仍允许：实现可能比签名更一般
+            #（如 ?b -> ?b 与 a），其安全性由逃逸检查/值限制把关。
+            raise self._sig_or_mismatch(va_path, other_path, va, other, infinite=False)
+        if occurs(va, other):
+            raise self._sig_or_mismatch(va_path, other_path, va, other, infinite=True)
+        return bind(s, va, other)
+
+    def _sig_or_mismatch(self, left_path, right_path, left_type, right_type, infinite):
+        """若处于某个签名检查的活跃作用域，抛签名不匹配；否则抛普通统一失败。"""
+        if self.active_sigs and _touches_active_rigid(left_type, right_type, self.active_sigs[-1][3]):
+            let_path, name, sig_text = self.active_sigs[-1][:3]
+            raise SignatureMismatchError(
+                let_path, name, sig_text, left_path, right_path, left_type, right_type,
+                "occurs 检查失败（无限类型）" if infinite else "构造子/刚性变量冲突",
+            )
+        if infinite:
+            raise InfiniteTypeError(left_path, right_path, left_type, right_type)
+        raise TypeMismatchError(left_path, right_path, left_type, right_type)
 
     # ------------------------------------------------------------ 规则
 
@@ -258,19 +317,34 @@ class Inferencer:
         return s3, apply(s3, ret_var)
 
     def _ti_let(self, node, env, s, path):
+        name = node["name"]
+        sig_text = node.get("sig")
+        if sig_text is not None:
+            return self._ti_let_signed(node, env, s, path, name, sig_text)
+
         s1, bound_raw = self.ti(node["bound"], env, s, path + ("bound",))
         bound_t = apply(s1, bound_raw)
-        name = node["name"]
+        return self._finish_let(node, env, path, name, s1, bound_t, bound_t,
+                                signed=False, sig_text="", rigids=())
 
+    def _finish_let(self, node, env, path, name, s1, bound_t, scheme_body,
+                    signed, sig_text, rigids):
         bound_tag = node["bound"]["tag"]
-        if bound_tag in _VALUE_TAGS:
+        if signed:
+            # 签名绑定：量化集合恰为声明的刚性变量；实现中残留的
+            # 未约束推断变量按单态处理（签名比推断更具体是允许的）。
+            quantified: Tuple[TVar, ...] = ()
+        elif bound_tag in _VALUE_TAGS:
             env_free = _env_free_vars(env, s1)
-            quantified = tuple(v for v in free_tvars(bound_t) if v not in env_free)
-            scheme = TypeScheme(frozenset(quantified), bound_t)
+            # 刚性变量绝不允许进入普通泛化（它们只属于签名方案）。
+            quantified = tuple(
+                v for v in free_tvars(bound_t)
+                if v not in env_free and not isinstance(v, RigidTVar)
+            )
         else:
             # 值限制：扩展式（ref、apply、read、write、if ...）不泛化。
             quantified = ()
-            scheme = TypeScheme(frozenset(), bound_t)
+        scheme = TypeScheme(frozenset(quantified), bound_t)
 
         self.generalizations.append(
             Generalization(
@@ -283,13 +357,96 @@ class Inferencer:
                     (ename, esch.quantified, apply(s1, esch.t))
                     for ename, esch in env.items()
                 ),
+                signed=signed,
+                signature_text=sig_text,
+                rigid_vars=tuple(rigids),
             )
         )
 
         body_env = dict(env)
+        if signed:
+            # 签名绑定：方案体取签名形状（应用当前替换后的刚性变量），
+            # 量化集合就是声明的刚性变量。
+            scheme = TypeScheme(frozenset(rigids), apply(s1, scheme_body))
         body_env[name] = scheme
         s2, body_t = self.ti(node["body"], body_env, s1, path + ("body",))
         return s2, body_t
+
+    def _ti_let_signed(self, node, env, s, path, name, sig_text):
+        """带 rank-1 显式签名的 let 检查。
+
+        1. 解析签名并为每个量化变量造**刚性**变量（检查期间保持刚性）；
+        2. 在普通推断下推导绑定表达式；
+        3. 把实现类型与签名类型统一（失败归类为签名不匹配）；
+        4. 值限制：扩展式绑定仍残留刚性变量则拒绝（值限制冲突）；
+        5. 逃逸检查：刚性变量被外层作用域的推断变量吞并则拒绝
+           （逃逸的刚性变量）——典型于实现捕获外层单态变量；
+        6. 绑定按声明的方案（量化变量 = 刚性变量）进入函数体，
+           每次使用独立实例化；其余残留的内部推断变量保持单态。
+        """
+        bound_path = path + ("bound",)
+        parsed = parse_signature(sig_text)  # 校验阶段已解析过一次
+        rigids, sig_type = build_signature_type(parsed, self.fresh_rigid)
+
+        # 记录检查前外层已存在的推断变量，用于识别“外层单态变量”。
+        outer_flex = {v for v in _all_subst_vars(s) if not isinstance(v, RigidTVar)}
+        outer_flex |= _env_flex_vars(env)
+
+        frame = (path, name, sig_text, set(rigids))
+        self.active_sigs.append(frame)
+        try:
+            s1, bound_raw = self.ti(node["bound"], env, s, bound_path)
+        finally:
+            self.active_sigs.pop()
+        bound_t = apply(s1, bound_raw)
+        sig_t1 = apply(s1, sig_type)
+
+        # 3) 实现类型与签名类型统一（此上下文中刚性刚被移出 active，
+        #    但 RigidTVar 自身的统一规则不变；用专门包装归类错误）。
+        try:
+            s2 = self.unify(
+                s1, bound_t, sig_t1,
+                bound_path, path + ("sig",),
+                f"let {name} 的显式签名检查",
+            )
+        except (TypeMismatchError, InfiniteTypeError) as exc:
+            raise SignatureMismatchError(
+                path, name, sig_text,
+                exc.left_path, exc.right_path, exc.left_type, exc.right_type,
+                "occurs 检查失败（无限类型）" if isinstance(exc, InfiniteTypeError) else "构造子/刚性变量冲突",
+            ) from exc
+
+        bound_t2 = apply(s2, bound_raw)
+        sig_t2 = apply(s2, sig_type)
+        bound_tag = node["bound"]["tag"]
+
+        # 4) 逃逸检查（先于值限制）：刚性变量是否被**外层**推断变量吞并。
+        #    内层新生成的推断变量与刚性合并是合法的（它们随绑定消亡/泛化）。
+        #    同时把“与刚性等价的内部柔性变量”收集出来：若扩展式绑定后
+        #    这些变量仍未解析成具体类型，声明的多态就是被单态计算结果
+        #    冒充的，归为值限制冲突。
+        dangling_flex: set = set()
+        for rigid in rigids:
+            resolved_rigid = apply(s2, rigid)
+            for flex in outer_flex:
+                resolved = apply(s2, flex)
+                if resolved == resolved_rigid:
+                    raise EscapedRigidVariableError(path, name, sig_text, resolved_rigid, bound_path)
+        for v in free_tvars(sig_t2):
+            # 签名类型里残留的未绑定柔性变量都来自绑定内部，与某个刚性位置等价。
+            if not isinstance(v, RigidTVar):
+                dangling_flex.add(v)
+
+        # 5) 值限制：扩展式不能承载声明的多态。
+        surviving_rigids = _mentions_any(sig_t2, tuple(apply(s2, r) for r in rigids))
+        if bound_tag not in _VALUE_TAGS and (surviving_rigids or dangling_flex):
+            raise ValueRestrictionConflictError(path, name, sig_text, bound_tag, bound_path)
+
+        return self._finish_let(
+            node, env, path, name, s2, bound_t2, sig_t2,
+            signed=True, sig_text=sig_text,
+            rigids=tuple(v for v in rigids for v in (apply(s2, v),) if isinstance(v, RigidTVar)),
+        )
 
     def _ti_if(self, node, env, s, path):
         s1, cond_t = self.ti(node["cond"], env, s, path + ("cond",))
@@ -380,6 +537,32 @@ def _env_free_vars(env: Dict[str, TypeScheme], s: Subst):
             if v not in quantified:
                 free.add(v)
     return free
+
+
+def _env_flex_vars(env: Dict[str, TypeScheme]):
+    """环境里当前出现的全部普通（非刚性）推断变量。"""
+    out = set()
+    for scheme in env.values():
+        for v in free_tvars(scheme.t):
+            if not isinstance(v, RigidTVar):
+                out.add(v)
+    return out
+
+
+def _all_subst_vars(s: Subst):
+    out = set(s)
+    for rhs in s.values():
+        out.update(free_tvars(rhs))
+    return out
+
+
+def _mentions_any(tp: Type, vars_: Tuple[TVar, ...]) -> bool:
+    wanted = set(vars_)
+    return any(v in wanted for v in free_tvars(tp))
+
+
+def _touches_active_rigid(left: Type, right: Type, rigids: set) -> bool:
+    return any(isinstance(v, RigidTVar) and v in rigids for v in (*free_tvars(left), *free_tvars(right)))
 
 
 # ---------------------------------------------------------------- 入口

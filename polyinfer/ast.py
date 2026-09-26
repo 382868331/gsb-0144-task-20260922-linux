@@ -10,7 +10,8 @@ tag                字段
 ``"bool"``         ``value: bool``
 ``"lambda"``       ``param: str``, ``body: Node``
 ``"apply"``        ``fn: Node``, ``arg: Node``
-``"let"``          ``name: str``, ``bound: Node``, ``body: Node``
+``"let"``          ``name: str``, ``bound: Node``, ``body: Node``,
+                   可选 ``sig: str``（rank-1 显式类型签名）
 ``"if"``           ``cond: Node``, ``then: Node``, ``else_: Node``
 ``"ref"``          ``inner: Node``       —— 创建引用（等价 ML 的 ref e）
 ``"read"``         ``ref: Node``         —— 解引用（!e）
@@ -35,6 +36,7 @@ NODE_FIELDS: Dict[str, Tuple[str, ...]] = {
     "bool": ("value",),
     "lambda": ("param", "body"),
     "apply": ("fn", "arg"),
+    # sig 是可选字段，故不列在必需字段里；其存在性由校验器单独处理。
     "let": ("name", "bound", "body"),
     "if": ("cond", "then", "else_"),
     "ref": ("inner",),
@@ -68,8 +70,11 @@ def apply(fn: Node, arg: Node) -> Node:
     return {"tag": "apply", "fn": fn, "arg": arg}
 
 
-def let(name: str, bound: Node, body: Node) -> Node:
-    return {"tag": "let", "name": name, "bound": bound, "body": body}
+def let(name: str, bound: Node, body: Node, sig: "str | None" = None) -> Node:
+    node: Node = {"tag": "let", "name": name, "bound": bound, "body": body}
+    if sig is not None:
+        node["sig"] = sig
+    return node
 
 
 def if_(cond: Node, then: Node, else_: Node) -> Node:
@@ -126,9 +131,10 @@ class AstValidator:
         fields = NODE_FIELDS.get(tag)
         if fields is None:
             self._fail(path, f"未知节点 tag {tag!r}")
-        extra = set(node) - {"tag", *fields}
+        allowed_extra = {"sig"} if tag == "let" else set()
+        extra = set(node) - {"tag", *fields} - allowed_extra
         if extra:
-            self._fail(path, f"存在多余字段 {sorted(extra)}；{tag} 节点只允许 {list(fields)}")
+            self._fail(path, f"存在多余字段 {sorted(extra)}；{tag} 节点只允许 {list(fields) + sorted(allowed_extra)}")
         missing = [f for f in fields if f not in node]
         if missing:
             self._fail(path, f"缺少字段 {missing}")
@@ -156,6 +162,14 @@ class AstValidator:
         elif tag in ("lambda", "let"):
             name_field = "param" if tag == "lambda" else "name"
             self._check_name(path, node[name_field])
+            if tag == "let" and "sig" in node:
+                # 签名在推断前先做纯语法解析校验（不依赖推断状态）。
+                from .signature import parse_signature
+
+                try:
+                    parse_signature(node["sig"])
+                except InvalidAstError as exc:
+                    raise InvalidAstError(path + ("sig",), exc.message) from exc
         # let 的非递归检查在绑定子树的 scope 处理里完成。
 
         # 递归校验子节点

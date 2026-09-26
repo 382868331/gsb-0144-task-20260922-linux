@@ -108,3 +108,81 @@ class InfiniteTypeError(UnificationError):
             expanded,
             f"无限类型：{variable} 出现在 {expanded} 中",
         )
+
+
+class SignatureMismatchError(PolytypeError):
+    """显式 rank-1 签名与绑定表达式实际类型不兼容。
+
+    签名检查时，绑定体在刚性类型变量下被推导，最后把推导出的类型与
+    签名类型统一；该统一失败即签名过窄/形状不符（构造子冲突、
+    无限类型或两个不同刚性变量被迫合并）。携带 let 绑定位置与
+    失败统一深入到的两端路径和叶子类型。
+    """
+
+    def __init__(
+        self,
+        let_path: Path,
+        name: str,
+        signature_text: str,
+        left_path: Path,
+        right_path: Path,
+        left_type: Any,
+        right_type: Any,
+        reason: str,
+    ) -> None:
+        self.path = let_path
+        self.name = name
+        self.signature = signature_text
+        self.left_path = left_path
+        self.right_path = right_path
+        self.left_type = left_type
+        self.right_type = right_type
+        self.reason = reason
+        super().__init__(
+            f"let {name!r} 的显式签名 {signature_text!r} 与其实现不兼容（{reason}）："
+            f"实现类型 {left_type} @ {format_path(left_path)}；"
+            f"签名类型 {right_type} @ {format_path(right_path)}"
+        )
+
+
+class EscapedRigidVariableError(PolytypeError):
+    """签名的刚性类型变量逃逸到了绑定之外的外层环境。
+
+    典型反例：签名比实现更“宽”，而实现捕获了外层的单态变量，
+    例如 ``λx. let f : forall a. a -> a = λy. x in ...``——实现体
+    要求参数类型等于外层已被固定的单态变量，刚性变量 ``a`` 会被
+    外层推断变量吞并，若允许泛化，调用两次不同类型就会污染外层。
+    """
+
+    def __init__(self, let_path: Path, name: str, signature_text: str, variable: Any, bound_path: Path) -> None:
+        self.path = let_path
+        self.name = name
+        self.signature = signature_text
+        self.variable = variable
+        self.bound_path = bound_path
+        super().__init__(
+            f"let {name!r} 的签名 {signature_text!r} 中刚性变量 {variable} 逃逸出绑定："
+            f"它被绑定表达式（{format_path(bound_path)}）中来自外层作用域的单态变量约束，"
+            f"该绑定不能获得声明的多态方案"
+        )
+
+
+class ValueRestrictionConflictError(PolytypeError):
+    """扩展式绑定的显式签名要求多态，与值限制冲突。
+
+    只有语法值（字面量、lambda、变量）才能承载量化变量；
+    ``ref e``、函数应用等扩展式即便写了含 ``forall`` 的签名，
+    也不能包装成可任意实例化的多态值（引用多态漏洞的显式版本）。
+    """
+
+    def __init__(self, let_path: Path, name: str, signature_text: str, bound_tag: str, bound_path: Path) -> None:
+        self.path = let_path
+        self.name = name
+        self.signature = signature_text
+        self.bound_tag = bound_tag
+        self.bound_path = bound_path
+        super().__init__(
+            f"let {name!r} 的签名 {signature_text!r} 要求多态，但绑定表达式 "
+            f"{bound_tag!r}（{format_path(bound_path)}）是扩展式而非语法值："
+            f"值限制下不能把单态引用/计算结果包装成可任意实例化的多态值"
+        )
