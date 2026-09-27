@@ -86,6 +86,60 @@ def main() -> None:
     else:  # pragma: no cover - 演示中绝不应发生
         raise SystemExit("内部错误：引用多态漏洞未被拦截")
 
+    section("正常结果 3：互相递归组 letrec（书写顺序不影响结论）")
+    # f(x) = x ? false : g(x)；g(x) = x ? true : f(x)
+    # 两个成员彼此引用：分析 f 时 g 已在组内可见；f/g 共享同一单态
+    # 参数类型，整组联立后各自得到 Bool -> Bool。
+    f_def = A.lambda_(
+        "x",
+        A.if_(A.var("x"), A.bool_(False), A.apply(A.var("g"), A.var("x"))),
+    )
+    g_def = A.lambda_(
+        "x",
+        A.if_(A.var("x"), A.bool_(True), A.apply(A.var("f"), A.var("x"))),
+    )
+    mutual = A.letrec(
+        [("f", f_def), ("g", g_def)], A.apply(A.var("f"), A.bool_(True))
+    )
+    show_success("letrec f,g 互相调用", mutual)
+
+    section("递归组类型冲突：f 返回 Bool，g 却在同一递归里返回 Int")
+    g_bad = A.lambda_(
+        "y",
+        A.if_(A.var("y"), A.int_(1), A.apply(A.var("f"), A.var("y"))),
+    )
+    conflict = A.letrec(
+        [("f", f_def), ("g", g_bad)], A.apply(A.var("f"), A.bool_(True))
+    )
+    try:
+        infer(conflict)
+    except TypeMismatchError as exc:
+        print(f"实际拒绝类型：{type(exc).__name__}（整组联立后构造性无解）")
+        print(f"  左端类型：{exc.left_type}  路径：{format_path(exc.left_path)}")
+        print(f"  右端类型：{exc.right_type}  路径：{format_path(exc.right_path)}")
+    else:  # pragma: no cover
+        raise SystemExit("内部错误：递归组类型冲突未被拦截")
+
+    section("递归组也堵引用漏洞：r = ref(λz.z); h = λv. r := v")
+    print("r 是扩展式成员，其单元自由变量对全组都是危险变量，")
+    print("h 虽是 lambda 也不被泛化；先 h 1 再按函数使用单元必须被拒绝。\n")
+    group_hole = A.letrec(
+        [("r", A.ref(A.lambda_("z", A.var("z")))),
+         ("h", A.lambda_("v", A.write_(A.var("r"), A.var("v"))))],
+        A.let(
+            "u1", A.apply(A.var("h"), A.int_(1)),
+            A.apply(A.read(A.var("r")), A.bool_(True)),
+        ),
+    )
+    try:
+        infer(group_hole)
+    except TypeMismatchError as exc:
+        print(f"实际拒绝类型：{type(exc).__name__}（递归组未成为值限制后门）")
+        print(f"  左端类型：{exc.left_type}  路径：{format_path(exc.left_path)}")
+        print(f"  右端类型：{exc.right_type}  路径：{format_path(exc.right_path)}")
+    else:  # pragma: no cover
+        raise SystemExit("内部错误：递归组引用漏洞未被拦截")
+
     section("附：自应用 λx. x x 的无限类型也被 occurs 检查拦截")
     try:
         infer(A.lambda_("x", A.apply(A.var("x"), A.var("x"))))
@@ -94,8 +148,8 @@ def main() -> None:
         print(f"  变量 {exc.left_type} 不得出现在 {exc.right_type} 中")
         print(f"  路径：{format_path(exc.left_path)} 与 {format_path(exc.right_path)}")
 
-    print("\n演示结束：1 个高阶主类型 + 1 个双实例多态推导成功，")
-    print("引用赋值多态漏洞与自应用无限类型均被真实计算拦截。")
+    print("\n演示结束：组合算子/let 多态/互相递归组均真实推导成功，")
+    print("递归组冲突、引用多态漏洞（含经递归组）与自应用均被真实拦截。")
 
 
 if __name__ == "__main__":

@@ -52,7 +52,11 @@ class NodeLimitError(PolytypeError):
 
 
 class UnboundVariableError(PolytypeError):
-    """使用了未在作用域中绑定的变量（非递归 let，lambda 参数为单态绑定）。"""
+    """使用了未在作用域中绑定的变量。
+
+    普通 ``let`` 非递归（绑定里引用自身报此错）；自递归/互相递归须用
+    ``letrec`` 组，组内未声明的名字同样报此错。
+    """
 
     def __init__(self, path: Path, name: str) -> None:
         self.path = path

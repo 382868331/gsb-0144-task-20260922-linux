@@ -144,13 +144,21 @@ def check_result(result: Any) -> RefCheckReport:
         for _ename, quantified, body in g.env_snapshot:
             body_free = ref_free_vars(ref_apply(subst, body))
             env_free |= body_free - set(quantified)
-        expected = (bound_free - env_free) if is_value else set()
+        # letrec：扩展式成员（如 ref）的自由变量对**整组**都是危险变量，
+        # 不能借绑定组在另一个 lambda 成员的方案里被通用化。
+        group_danger: Set[TVar] = set()
+        for _mname, mtag, mtype in getattr(g, "group_members", ()):
+            if mtag not in value_tags:
+                group_danger |= ref_free_vars(ref_apply(subst, mtype))
+        forbidden = env_free | group_danger
+        expected = (bound_free - forbidden) if is_value else set()
         actual = set(g.generalized)
         if actual != expected:
             raise ReferenceCheckFailure(
                 f"let {g.name!r} @ {g.path} 泛化集合不合法："
                 f"核心给出 {sorted(v.ident for v in actual)}，"
-                f"独立重算（{g.bound_tag} 是{'值' if is_value else '扩展式'}）"
+                f"独立重算（{g.bound_tag} 是{'值' if is_value else '扩展式'}，"
+                f"组危险变量 {sorted(v.ident for v in group_danger)}）"
                 f"应为 {sorted(v.ident for v in expected)}"
             )
 

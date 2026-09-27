@@ -10,6 +10,9 @@
   冲突（类型不一致），引用类型按不变式逐点统一。
 * **值限制**：``let`` 只对“非扩展（语法值）”绑定泛化——字面量、lambda、变量；
   ``ref e`` 等其他表达式得到单态类型，堵住引用多态漏洞。
+* **互相递归组**：``letrec`` 先把组内名字全部以单态类型变量入环境，
+  再在同一条替换线程上联立全部绑定，整组结束后统一泛化；扩展式成员
+  的自由变量是全组危险变量，引用漏洞不能借递归组逃逸。
 * **lambda 参数单态**：参数以平凡单态类型方案入环境，其类型变量在整个
   函数体内只允许被统一成一个类型。
 * **约束留痕**：每次统一（含函数/引用深入后的子等式）都记录参与统一前的
@@ -97,6 +100,9 @@ class Generalization:
     bound_type: Type
     generalized: Tuple[TVar, ...]
     env_snapshot: Tuple[Tuple[str, frozenset, Type], ...]
+    # letrec 组在整组统一结束后的全部成员（名字, 绑定 tag, 最终类型）；
+    # 普通 let 为空元组。检查器自行据此重算组危险变量，不信任核心结论。
+    group_members: Tuple[Tuple[str, str, Type], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -272,24 +278,125 @@ class Inferencer:
             quantified = ()
             scheme = TypeScheme(frozenset(), bound_t)
 
-        self.generalizations.append(
-            Generalization(
-                path=path,
-                name=name,
-                bound_tag=bound_tag,
-                bound_type=bound_t,
-                generalized=quantified,
-                env_snapshot=tuple(
-                    (ename, esch.quantified, apply(s1, esch.t))
-                    for ename, esch in env.items()
-                ),
-            )
+        self._record_generalization(
+            path, name, bound_tag, bound_t, frozenset(quantified), env, s1
         )
 
         body_env = dict(env)
         body_env[name] = scheme
         s2, body_t = self.ti(node["body"], body_env, s1, path + ("body",))
         return s2, body_t
+
+    def _ti_letrec(self, node, env, s, path):
+        """互相递归绑定组：先整组按同一套约束求解，再统一决定泛化。
+
+        步骤（顺序与绑定书写顺序无关地产生同一主类型）：
+
+        1. 给组内每个名字一个全新类型变量，以**单态方案**放入环境——
+           分析任一成员时其他成员已经可被引用，但暂不多态实例化；
+        2. 依次分析全部绑定，约束累积到同一条替换线程，等价于
+           对整组方程做一次统一；成员间共享的变量在此被联立；
+        3. 整组检查结束后一次性计算危险变量（环境自由变量 ∪
+           每个扩展式成员最终类型的自由变量），只对语法值成员把其
+           类型中不属于危险集的变量通用化；
+        4. 用得到的方案检查 body。
+
+        扩展式（如 ``ref``）成员的自由变量对**全组**不可泛化：
+        可变单元即便在另一个 lambda 成员的类型里出现也保持单态，
+        递归组不能成为绕过值限制的后门。
+        """
+        binds = node["binds"]
+        names = [entry["name"] for entry in binds]
+
+        # 1) 每个成员一个待求的单态类型变量。
+        member_vars = {name: self.fresh() for name in names}
+        group_env = dict(env)
+        for name in names:
+            group_env[name] = TypeScheme(frozenset(), member_vars[name])
+
+        # 2) 整组联立：所有绑定共享同一替换线程与彼此的单态假设。
+        s_cur = s
+        bound_types = {}
+        for index, entry in enumerate(binds):
+            s_cur, raw_t = self.ti(
+                entry["bound"],
+                group_env,
+                s_cur,
+                path + ("binds", f"[{index}]", "bound"),
+            )
+            s_cur = self.unify(
+                s_cur,
+                apply(s_cur, member_vars[entry["name"]]),
+                apply(s_cur, raw_t),
+                path + ("binds", f"[{index}]"),
+                path + ("binds", f"[{index}]", "bound"),
+                "letrec 成员名与其绑定表达式类型必须一致",
+            )
+            bound_types[entry["name"]] = apply(s_cur, raw_t)
+
+        # 3) 整组求解完成后再决定哪些变量可以通用化。
+        env_free = _env_free_vars(env, s_cur)
+        # 危险变量 = 环境自由变量 ∪ 所有扩展式成员的最终自由变量。
+        # 语法值（lambda 等）成员之间共享、且不与扩展式/环境共享的变量
+        # 才允许进入各自的方案。
+        dangerous = set(env_free)
+        for entry in binds:
+            if entry["bound"]["tag"] not in _VALUE_TAGS:
+                dangerous.update(free_tvars(bound_types[entry["name"]]))
+
+        members_snapshot = tuple(
+            (
+                entry["name"],
+                entry["bound"]["tag"],
+                apply(s_cur, bound_types[entry["name"]]),
+            )
+            for entry in binds
+        )
+
+        body_env = dict(env)
+        for member_index, entry in enumerate(binds):
+            name = entry["name"]
+            final_t = apply(s_cur, bound_types[name])
+            if entry["bound"]["tag"] in _VALUE_TAGS:
+                quantified = frozenset(
+                    v for v in free_tvars(final_t) if v not in dangerous
+                )
+            else:
+                quantified = frozenset()
+            self._record_generalization(
+                path + ("binds", f"[{member_index}]"),
+                name,
+                entry["bound"]["tag"],
+                final_t,
+                quantified,
+                env,
+                s_cur,
+                group_members=members_snapshot,
+            )
+            body_env[name] = TypeScheme(quantified, final_t)
+
+        # 4) body 在整组方案下检查。
+        s2, body_t = self.ti(node["body"], body_env, s_cur, path + ("body",))
+        return s2, body_t
+
+    def _record_generalization(
+        self, path, name, bound_tag, bound_t, quantified, env, s,
+        group_members=(),
+    ):
+        self.generalizations.append(
+            Generalization(
+                path=path,
+                name=name,
+                bound_tag=bound_tag,
+                bound_type=bound_t,
+                generalized=tuple(sorted(quantified, key=lambda v: v.ident)),
+                env_snapshot=tuple(
+                    (ename, esch.quantified, apply(s, esch.t))
+                    for ename, esch in env.items()
+                ),
+                group_members=group_members,
+            )
+        )
 
     def _ti_if(self, node, env, s, path):
         s1, cond_t = self.ti(node["cond"], env, s, path + ("cond",))
@@ -355,6 +462,7 @@ class Inferencer:
         "ref": _ti_ref,
         "read": _ti_read,
         "write": _ti_write,
+        "letrec": _ti_letrec,
     }
 
 
@@ -391,7 +499,8 @@ def infer(ast: ast_mod.Node, max_nodes: int = 500) -> InferenceResult:
     :param max_nodes: 接口节点上限，默认 500；
     :raises InvalidAstError: AST 结构或字面量非法（路径可定位）；
     :raises NodeLimitError: 节点数超过上限（资源拒绝，非类型无解）；
-    :raises UnboundVariableError: 出现未绑定变量（含递归 let）；
+    :raises UnboundVariableError: 出现未绑定变量（普通 ``let`` 仍非递归，
+        递归定义须用 ``letrec``）；
     :raises TypeMismatchError / InfiniteTypeError: 已证明不可类型化，
         携带失败约束两端的 AST 路径与叶子类型。
     """
