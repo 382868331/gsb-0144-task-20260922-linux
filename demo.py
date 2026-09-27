@@ -11,6 +11,8 @@
 2. 实际触发的拒绝：引用多态漏洞程序
    ``let r = ref(λz.z) in r := 1; !r`` 被值限制拒绝，
    打印失败约束两端的类型与 AST 路径。
+3. 互相递归组：even/odd 互相调用成功（与绑定书写顺序无关），
+   以及一个跨绑定的类型冲突被 letrec 整组检查拒绝。
 """
 
 import time
@@ -94,8 +96,73 @@ def main() -> None:
         print(f"  变量 {exc.left_type} 不得出现在 {exc.right_type} 中")
         print(f"  路径：{format_path(exc.left_path)} 与 {format_path(exc.right_path)}")
 
+    section("互相递归组：letrec even/odd（iszero/pred 由外层参数提供）")
+    even = (
+        "even",
+        A.lambda_(
+            "n",
+            A.if_(
+                A.apply(A.var("iszero"), A.var("n")),
+                A.bool_(True),
+                A.apply(A.var("odd"), A.apply(A.var("pred"), A.var("n"))),
+            ),
+        ),
+    )
+    odd = (
+        "odd",
+        A.lambda_(
+            "n",
+            A.if_(
+                A.apply(A.var("iszero"), A.var("n")),
+                A.bool_(False),
+                A.apply(A.var("even"), A.apply(A.var("pred"), A.var("n"))),
+            ),
+        ),
+    )
+    show_success(
+        "letrec even/odd（正序）",
+        A.lambda_("iszero", A.lambda_("pred", A.letrec([even, odd], A.var("even")))),
+    )
+    show_success(
+        "letrec even/odd（绑定交换顺序，结果相同）",
+        A.lambda_("iszero", A.lambda_("pred", A.letrec([odd, even], A.var("even")))),
+    )
+
+    section("拒绝边界：递归组内跨绑定的类型冲突")
+    conflict = A.letrec(
+        [
+            # f 把参数当 Bool 用（if 条件），g 却把 Int 参数直接传给 f。
+            (
+                "f",
+                A.lambda_(
+                    "x",
+                    A.if_(
+                        A.var("x"),
+                        A.apply(A.var("g"), A.int_(1)),
+                        A.apply(A.var("g"), A.int_(2)),
+                    ),
+                ),
+            ),
+            ("g", A.lambda_("y", A.apply(A.var("f"), A.var("y")))),
+        ],
+        A.var("f"),
+    )
+    print("程序意图：f 要求 Bool 参数，g 把自己收到的 Int 参数传给 f。")
+    print("整组在同一套约束下检查，冲突在 g 的参数处被定位。\n")
+    try:
+        infer(conflict)
+    except TypeMismatchError as exc:
+        print(f"实际拒绝类型：{type(exc).__name__}（已证明无解）")
+        print(f"  左端类型：{exc.left_type}")
+        print(f"  左端路径：{format_path(exc.left_path)}")
+        print(f"  右端类型：{exc.right_type}")
+        print(f"  右端路径：{format_path(exc.right_path)}")
+    else:  # pragma: no cover - 演示中绝不应发生
+        raise SystemExit("内部错误：递归组类型冲突未被拦截")
+
     print("\n演示结束：1 个高阶主类型 + 1 个双实例多态推导成功，")
     print("引用赋值多态漏洞与自应用无限类型均被真实计算拦截。")
+    print("互相递归组正/逆序同型，组内类型冲突被真实计算拦截。")
 
 
 if __name__ == "__main__":

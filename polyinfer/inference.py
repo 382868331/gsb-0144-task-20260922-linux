@@ -10,6 +10,10 @@
   冲突（类型不一致），引用类型按不变式逐点统一。
 * **值限制**：``let`` 只对“非扩展（语法值）”绑定泛化——字面量、lambda、变量；
   ``ref e`` 等其他表达式得到单态类型，堵住引用多态漏洞。
+* **互相递归组（letrec）**：整组绑定先入单态占位类型变量（与书写顺序无关），
+  在同一套约束下检查全部绑定，整组通过后才逐绑定按值限制泛化；
+  泛化闭包排除外部环境与其他组员的自由变量，可修改引用（ref 等扩展式）
+  仍不泛化，安全限制不因递归组而放松。
 * **lambda 参数单态**：参数以平凡单态类型方案入环境，其类型变量在整个
   函数体内只允许被统一成一个类型。
 * **约束留痕**：每次统一（含函数/引用深入后的子等式）都记录参与统一前的
@@ -291,6 +295,75 @@ class Inferencer:
         s2, body_t = self.ti(node["body"], body_env, s1, path + ("body",))
         return s2, body_t
 
+    def _ti_letrec(self, node, env, s, path):
+        bindings = node["bindings"]
+        names = [b["name"] for b in bindings]
+
+        # 1) 整组先入单态占位类型变量：分析任一绑定时，组内其他名字
+        #    均已可引用，结果与绑定书写顺序无关。
+        placeholders = {name: self.fresh() for name in names}
+        group_env = dict(env)
+        for name in names:
+            group_env[name] = TypeScheme(frozenset(), placeholders[name])
+
+        # 2) 同一套替换线程下检查整组：递归出现与定义必须一致。
+        s_cur = s
+        for b in bindings:
+            bpath = path + ("bindings", b["name"])
+            s_cur, bound_t = self.ti(b["bound"], group_env, s_cur, bpath)
+            s_cur = self.unify(
+                s_cur,
+                apply(s_cur, placeholders[b["name"]]),
+                bound_t,
+                bpath,
+                bpath,
+                f"递归绑定 {b['name']} 的递归用法与其定义类型必须一致",
+            )
+
+        # 3) 整组检查结束后才泛化：逐绑定按值限制决定，闭包排除外部
+        #    环境与其他组员的自由变量（共享变量保持单态，保证安全）。
+        env_free = _env_free_vars(env, s_cur)
+        final_types = {name: apply(s_cur, placeholders[name]) for name in names}
+        outer_snapshot = tuple(
+            (ename, esch.quantified, apply(s_cur, esch.t))
+            for ename, esch in env.items()
+        )
+        body_env = dict(env)
+        for b in bindings:
+            name = b["name"]
+            bound_tag = b["bound"]["tag"]
+            final_t = final_types[name]
+            others_free = set()
+            for other in names:
+                if other != name:
+                    others_free |= set(free_tvars(final_types[other]))
+            if bound_tag in _VALUE_TAGS:
+                quantified = tuple(
+                    v for v in free_tvars(final_t)
+                    if v not in env_free and v not in others_free
+                )
+            else:
+                # 值限制：ref/apply 等扩展式即便在递归组内也不泛化。
+                quantified = ()
+            snapshot = outer_snapshot + tuple(
+                (other, frozenset(), final_types[other])
+                for other in names if other != name
+            )
+            self.generalizations.append(
+                Generalization(
+                    path=path + ("bindings", name),
+                    name=name,
+                    bound_tag=bound_tag,
+                    bound_type=final_t,
+                    generalized=quantified,
+                    env_snapshot=snapshot,
+                )
+            )
+            body_env[name] = TypeScheme(frozenset(quantified), final_t)
+
+        s2, body_t = self.ti(node["body"], body_env, s_cur, path + ("body",))
+        return s2, body_t
+
     def _ti_if(self, node, env, s, path):
         s1, cond_t = self.ti(node["cond"], env, s, path + ("cond",))
         s2 = self.unify(
@@ -351,6 +424,7 @@ class Inferencer:
         "lambda": _ti_lambda,
         "apply": _ti_apply,
         "let": _ti_let,
+        "letrec": _ti_letrec,
         "if": _ti_if,
         "ref": _ti_ref,
         "read": _ti_read,
